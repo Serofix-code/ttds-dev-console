@@ -26,6 +26,14 @@ bin\x64\Release\TTDSConsoleLauncher.exe
 bin\x64\Release\TTDSConsoleHook.dll
 ```
 
+## Optional Dependencies
+
+Freecam support requires **TTDS Relighting** by the Telltale Modding Group:
+
+https://github.com/Telltale-Modding-Group/TTDS-Relighting
+
+The console does not include Relight. It edits Relight's `RelightMod\RelightConfiguration_Development.ini`, so `freecam` commands will only work when Relight is installed in the game folder.
+
 ## Run
 
 ```bat
@@ -56,7 +64,7 @@ If the console appears and then disappears during the loading screen, that usual
 - `clear`: clear the console
 - `detach`: unload the hook DLL and close the console
 
-The current freecam command edits `RelightMod\RelightConfiguration_Development.ini`. Relight reads that value when a scene initializes, so you still need to reload or load a scene before the camera changes apply. A true live toggle needs a runtime Lua bridge or direct camera backend hooks.
+The current freecam command requires [TTDS Relighting](https://github.com/Telltale-Modding-Group/TTDS-Relighting) and edits `RelightMod\RelightConfiguration_Development.ini`. Relight reads that value when a scene initializes, so you still need to reload or load a scene before the camera changes apply. A true live toggle needs a runtime Lua bridge or direct camera backend hooks.
 
 ## Roadmap
 
