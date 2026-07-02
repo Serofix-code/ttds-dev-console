@@ -17,8 +17,10 @@ namespace {
 HMODULE g_module = nullptr;
 std::atomic_bool g_logEnabled{false};
 std::atomic_bool g_logConsoleEnabled{true};
+std::atomic_bool g_logCompactEnabled{true};
 std::atomic_bool g_fileTraceEnabled{true};
 std::atomic_bool g_debugStringTraceEnabled{true};
+std::atomic_bool g_logFailuresOnly{false};
 std::atomic_bool g_freecamEnabled{false};
 std::mutex g_logMutex;
 FILE* g_logFile = nullptr;
@@ -297,6 +299,72 @@ std::wstring DispositionText(DWORD creationDisposition) {
   }
 }
 
+std::wstring AccessVerb(DWORD desiredAccess) {
+  if (desiredAccess & GENERIC_WRITE) return L"WRITE";
+  if (desiredAccess & GENERIC_READ) return L"READ ";
+  if (desiredAccess & GENERIC_EXECUTE) return L"EXEC ";
+  return L"OPEN ";
+}
+
+std::wstring FileNameOnly(const std::wstring& path) {
+  const size_t slash = path.find_last_of(L"\\/");
+  if (slash == std::wstring::npos) return path;
+  return path.substr(slash + 1);
+}
+
+std::wstring CompactPath(const std::wstring& path) {
+  const std::wstring lower = ToLower(path);
+  const std::wstring game = ToLower(fs::current_path().wstring());
+  const std::wstring marker = L"the walking dead definitive series\\";
+  const size_t gameAt = lower.find(marker);
+  if (gameAt != std::wstring::npos) {
+    return path.substr(gameAt + marker.size());
+  }
+
+  if (lower.find(L"telltale games\\the walking dead definitive\\") != std::wstring::npos) {
+    return L"saves\\" + FileNameOnly(path);
+  }
+
+  if (!game.empty()) {
+    const size_t gameRootAt = lower.find(game);
+    if (gameRootAt != std::wstring::npos) {
+      size_t start = gameRootAt + game.size();
+      while (start < path.size() && (path[start] == L'\\' || path[start] == L'/')) ++start;
+      return path.substr(start);
+    }
+  }
+
+  return path;
+}
+
+std::wstring FileKind(const std::wstring& path) {
+  const std::wstring lower = ToLower(path);
+  if (lower.find(L"relightlevels/") != std::wstring::npos || lower.find(L"relightlevels\\") != std::wstring::npos) return L"relight";
+  if (lower.find(L"\\archives\\") != std::wstring::npos || lower.find(L"/archives/") != std::wstring::npos || lower.find(L".ttarch") != std::wstring::npos) return L"archive";
+  if (lower.find(L"prefs.prop") != std::wstring::npos) return L"prefs";
+  if (lower.find(L"save") != std::wstring::npos || lower.find(L".bundle") != std::wstring::npos) return L"save";
+  if (lower.find(L".lua") != std::wstring::npos) return L"lua";
+  if (lower.find(L".prop") != std::wstring::npos) return L"prop";
+  return L"file";
+}
+
+std::wstring FormatFileEvent(const std::wstring& apiName, DWORD desiredAccess, DWORD creationDisposition, HANDLE result, const std::wstring& path) {
+  const bool ok = result != INVALID_HANDLE_VALUE;
+  std::wstringstream message;
+  if (g_logCompactEnabled) {
+    message << (ok ? L"OK   " : L"FAIL ")
+            << AccessVerb(desiredAccess) << L" "
+            << FileKind(path) << L"  "
+            << CompactPath(path);
+  } else {
+    message << apiName << L" " << AccessText(desiredAccess) << L" "
+            << DispositionText(creationDisposition) << L" -> "
+            << (ok ? L"OK " : L"FAIL ")
+            << path;
+  }
+  return message.str();
+}
+
 std::vector<HMODULE> GetProcessModules() {
   std::vector<HMODULE> modules;
   HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
@@ -387,13 +455,8 @@ HANDLE WINAPI HookCreateFileW(
   if (!g_insideHook && g_logEnabled && g_fileTraceEnabled && fileName) {
     g_insideHook = true;
     const std::wstring path(fileName);
-    if (LooksInterestingPath(path)) {
-      std::wstringstream message;
-      message << L"CreateFileW " << AccessText(desiredAccess) << L" "
-              << DispositionText(creationDisposition) << L" -> "
-              << (result == INVALID_HANDLE_VALUE ? L"FAIL " : L"OK ")
-              << path;
-      LogLine(L"file", message.str());
+    if (LooksInterestingPath(path) && (!g_logFailuresOnly || result == INVALID_HANDLE_VALUE)) {
+      LogLine(L"file", FormatFileEvent(L"CreateFileW", desiredAccess, creationDisposition, result, path));
     }
     g_insideHook = false;
   }
@@ -425,13 +488,8 @@ HANDLE WINAPI HookCreateFileA(
   if (!g_insideHook && g_logEnabled && g_fileTraceEnabled && fileName) {
     g_insideHook = true;
     const std::wstring path = Utf8ToWide(fileName);
-    if (LooksInterestingPath(path)) {
-      std::wstringstream message;
-      message << L"CreateFileA " << AccessText(desiredAccess) << L" "
-              << DispositionText(creationDisposition) << L" -> "
-              << (result == INVALID_HANDLE_VALUE ? L"FAIL " : L"OK ")
-              << path;
-      LogLine(L"file", message.str());
+    if (LooksInterestingPath(path) && (!g_logFailuresOnly || result == INVALID_HANDLE_VALUE)) {
+      LogLine(L"file", FormatFileEvent(L"CreateFileA", desiredAccess, creationDisposition, result, path));
     }
     g_insideHook = false;
   }
@@ -502,6 +560,8 @@ void PrintHelp() {
       << "  log on    Start writing ttds-dev-console.log\n"
       << "  log off   Stop writing the log\n"
       << "  log console on/off  Show or hide live log lines in this console\n"
+      << "  log format compact/full  Change file log readability\n"
+      << "  log failures on/off  Only show failed file opens\n"
       << "  log path  Print the log file path\n"
       << "  log mark <text>  Add a marker to the log\n"
       << "  hooks refresh    Re-apply file/debug hooks to newly loaded modules\n"
@@ -516,6 +576,8 @@ void PrintStatus() {
   std::wcout << L"Hook DLL:   " << GetModulePath(g_module) << L"\n";
   std::wcout << L"Log:        " << (g_logEnabled ? L"on" : L"off") << L"\n";
   std::wcout << L"Live log:   " << (g_logConsoleEnabled ? L"console on" : L"console off") << L"\n";
+  std::wcout << L"Log format: " << (g_logCompactEnabled ? L"compact" : L"full") << L"\n";
+  std::wcout << L"Failures:   " << (g_logFailuresOnly ? L"only" : L"all") << L"\n";
   std::wcout << L"Log file:   " << g_logPath << L"\n";
   bool relightFreecam = false;
   const bool hasRelightFreecam = GetRelightFreecamSetting(&relightFreecam);
@@ -541,6 +603,8 @@ void CountArchives() {
 void PrintLogStatus() {
   std::wcout << L"Log:        " << (g_logEnabled ? L"on" : L"off") << L"\n";
   std::wcout << L"Live log:   " << (g_logConsoleEnabled ? L"console on" : L"console off") << L"\n";
+  std::wcout << L"Format:     " << (g_logCompactEnabled ? L"compact" : L"full") << L"\n";
+  std::wcout << L"Failures:   " << (g_logFailuresOnly ? L"only" : L"all") << L"\n";
   std::wcout << L"File trace: " << (g_fileTraceEnabled ? L"on" : L"off") << L"\n";
   std::wcout << L"Debug trace:" << (g_debugStringTraceEnabled ? L" on" : L" off") << L"\n";
   std::wcout << L"Path:       " << g_logPath << L"\n";
@@ -621,6 +685,12 @@ DWORD WINAPI ConsoleThread(void*) {
         std::cout << "Marked.\n";
       } else if (sub == "console") {
         if (parts.size() > 2) g_logConsoleEnabled = ToLowerAscii(parts[2]) != "off";
+        PrintLogStatus();
+      } else if (sub == "format") {
+        if (parts.size() > 2) g_logCompactEnabled = ToLowerAscii(parts[2]) != "full";
+        PrintLogStatus();
+      } else if (sub == "failures") {
+        if (parts.size() > 2) g_logFailuresOnly = ToLowerAscii(parts[2]) == "on" || ToLowerAscii(parts[2]) == "only";
         PrintLogStatus();
       } else if (sub == "files") {
         if (parts.size() > 2) g_fileTraceEnabled = ToLowerAscii(parts[2]) != "off";

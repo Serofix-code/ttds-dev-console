@@ -44,6 +44,28 @@ The launcher starts `WDC.exe`, injects the first process, and then watches for r
 
 If the console appears and then disappears during the loading screen, that usually means the first bootstrap process exited. Leave the launcher running and wait for the final game process to be detected.
 
+## Auto-Inject Watcher
+
+To make the console appear when you start the game normally from Steam, install the background watcher:
+
+```bat
+bin\x64\Release\TTDSConsoleLauncher.exe --install-autostart --game "C:\Program Files (x86)\Steam\steamapps\common\The Walking Dead The Telltale Definitive Series"
+```
+
+This adds a current-user Windows startup entry that runs a hidden watcher after login. The watcher only targets `WDC.exe` from the configured game folder.
+
+To remove it:
+
+```bat
+bin\x64\Release\TTDSConsoleLauncher.exe --uninstall-autostart
+```
+
+To run the watcher manually without installing it:
+
+```bat
+bin\x64\Release\TTDSConsoleLauncher.exe --watch-only --game "C:\Program Files (x86)\Steam\steamapps\common\The Walking Dead The Telltale Definitive Series"
+```
+
 ## Console Commands
 
 - `help`: show commands
@@ -54,6 +76,8 @@ If the console appears and then disappears during the loading screen, that usual
 - `log on`: start writing `ttds-dev-console.log` in the game folder and print live hook lines in the console
 - `log off`: stop writing new log entries
 - `log console on/off`: show or hide live log lines in the console
+- `log format compact/full`: switch between readable short file logs and raw Windows file-open logs
+- `log failures on/off`: show all interesting file opens or only failed file opens
 - `log path`: print the log file path
 - `log mark <text>`: add a marker while testing a scene/menu/action
 - `log files on/off`: enable or disable file-open tracing

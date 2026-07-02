@@ -37,7 +37,7 @@ cl /nologo /EHsc /std:c++17 /O2 /MD /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_UNIC
   /Fo"obj\TTDSConsoleLauncher\x64\Release\\" ^
   /Fe"bin\x64\Release\TTDSConsoleLauncher.exe" ^
   "src\TTDSConsoleLauncher\main.cpp" ^
-  /link /SUBSYSTEM:CONSOLE
+  /link /SUBSYSTEM:CONSOLE Advapi32.lib
 if errorlevel 1 exit /b 1
 
 cl /nologo /EHsc /std:c++17 /O2 /MD /W4 /LD /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_UNICODE /DUNICODE ^
