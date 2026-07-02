@@ -93,39 +93,52 @@ bool ValidateGameDir(const fs::path& gameDir, fs::path* exePath) {
   return true;
 }
 
-bool InjectDll(DWORD processId, const fs::path& dllPath) {
+void* GetRemoteKernel32Proc(DWORD processId, const char* procName) {
+  HMODULE localKernel32 = GetModuleHandleW(L"kernel32.dll");
+  const auto localProc = reinterpret_cast<uintptr_t>(GetProcAddress(localKernel32, procName));
+  if (!localKernel32 || !localProc) return nullptr;
+
+  const uintptr_t offset = localProc - reinterpret_cast<uintptr_t>(localKernel32);
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, processId);
+  if (snapshot == INVALID_HANDLE_VALUE) {
+    return reinterpret_cast<void*>(localProc);
+  }
+
+  MODULEENTRY32W module{};
+  module.dwSize = sizeof(module);
+  void* remoteProc = nullptr;
+  if (Module32FirstW(snapshot, &module)) {
+    do {
+      if (_wcsicmp(module.szModule, L"kernel32.dll") == 0) {
+        remoteProc = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(module.modBaseAddr) + offset);
+        break;
+      }
+    } while (Module32NextW(snapshot, &module));
+  }
+  CloseHandle(snapshot);
+  return remoteProc ? remoteProc : reinterpret_cast<void*>(localProc);
+}
+
+bool InjectDll(HANDLE process, DWORD processId, const fs::path& dllPath) {
   const std::wstring dll = fs::absolute(dllPath).wstring();
   const SIZE_T bytes = (dll.size() + 1) * sizeof(wchar_t);
-
-  HANDLE process = OpenProcess(
-      PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
-      FALSE,
-      processId);
-  if (!process) {
-    std::wcerr << L"OpenProcess failed: " << GetLastErrorText(GetLastError()) << L"\n";
-    return false;
-  }
 
   void* remotePath = VirtualAllocEx(process, nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
   if (!remotePath) {
     std::wcerr << L"VirtualAllocEx failed: " << GetLastErrorText(GetLastError()) << L"\n";
-    CloseHandle(process);
     return false;
   }
 
   if (!WriteProcessMemory(process, remotePath, dll.c_str(), bytes, nullptr)) {
     std::wcerr << L"WriteProcessMemory failed: " << GetLastErrorText(GetLastError()) << L"\n";
     VirtualFreeEx(process, remotePath, 0, MEM_RELEASE);
-    CloseHandle(process);
     return false;
   }
 
-  HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
-  auto loadLibrary = reinterpret_cast<LPTHREAD_START_ROUTINE>(GetProcAddress(kernel32, "LoadLibraryW"));
+  auto loadLibrary = reinterpret_cast<LPTHREAD_START_ROUTINE>(GetRemoteKernel32Proc(processId, "LoadLibraryW"));
   if (!loadLibrary) {
     std::wcerr << L"Could not find LoadLibraryW.\n";
     VirtualFreeEx(process, remotePath, 0, MEM_RELEASE);
-    CloseHandle(process);
     return false;
   }
 
@@ -142,7 +155,6 @@ bool InjectDll(DWORD processId, const fs::path& dllPath) {
   GetExitCodeThread(thread, &remoteResult);
   CloseHandle(thread);
   VirtualFreeEx(process, remotePath, 0, MEM_RELEASE);
-  CloseHandle(process);
 
   if (remoteResult == 0) {
     std::wcerr << L"LoadLibraryW returned null inside the game process.\n";
@@ -185,14 +197,14 @@ int wmain(int argc, wchar_t** argv) {
   startup.cb = sizeof(startup);
   PROCESS_INFORMATION processInfo{};
 
-  std::wcout << L"Launching: " << exePath << L"\n";
+  std::wcout << L"Launching suspended: " << exePath << L"\n";
   BOOL created = CreateProcessW(
       exePath.c_str(),
       commandLine.data(),
       nullptr,
       nullptr,
       FALSE,
-      0,
+      CREATE_SUSPENDED,
       nullptr,
       gameDir.c_str(),
       &startup,
@@ -204,18 +216,18 @@ int wmain(int argc, wchar_t** argv) {
   }
 
   std::wcout << L"WDC.exe PID: " << processInfo.dwProcessId << L"\n";
-  Sleep(1500);
-
   std::wcout << L"Injecting: " << dllPath << L"\n";
-  const bool injected = InjectDll(processInfo.dwProcessId, dllPath);
+  const bool injected = InjectDll(processInfo.hProcess, processInfo.dwProcessId, dllPath);
   if (!injected) {
-    std::wcerr << L"Injection failed. Leaving game running.\n";
+    std::wcerr << L"Injection failed. Resuming game without the dev console.\n";
+    ResumeThread(processInfo.hThread);
     CloseHandle(processInfo.hThread);
     CloseHandle(processInfo.hProcess);
     return 1;
   }
 
-  std::wcout << L"Injected. The in-game console window should appear shortly.\n";
+  std::wcout << L"Injected. Resuming game; the console window should appear shortly.\n";
+  ResumeThread(processInfo.hThread);
   CloseHandle(processInfo.hThread);
 
   if (!noWait) {
