@@ -9,12 +9,16 @@ This is an early proof-of-concept. It launches `WDC.exe`, watches the game's sta
 - injects a visible console into the active `WDC.exe` game process
 - can auto-watch for Steam-launched game sessions
 - logs readable file activity for saves, archives, Relight, and mods
+- helps modding by showing which `.ttarch2` archives, resource description scripts, save bundles, and mod files the game actually loads
 - can check for installed mod archives and flag disabled/quarantine folders that the game may still scan
 - can show failed file opens to help diagnose missing Relight files, mod conflicts, and other load issues
 - can save the console/log session to a `.txt` file
-- can toggle TTDS Relighting's freecam configuration when Relight is installed## Modding / Archive Debugging
-- helps with modding/debugging by showing which `.ttarch2` archives the game actually reads during startup and gameplay, making it easier to see what loads, in what order, and whether a mod/archive is being detected
+- can find the newest quicksave/autosave/checkpoint/save candidate with `reload`
+- can toggle TTDS Relighting's freecam configuration when Relight is installed
 
+## Modding / Archive Debugging
+
+- helps with modding/debugging by showing which `.ttarch2` archives the game actually reads during startup and gameplay, making it easier to see what loads, in what order, and whether a mod/archive is being detected
 
 The console can help with TTDS modding because it shows readable file activity while the game is running. This includes `.ttarch2` archive reads, save writes, Relight files, and mod-related file access.
 
@@ -27,7 +31,6 @@ For example, archive log lines like these show which game archives are being loa
 ```
 
 This can be useful for checking whether the game is reading the expected episode archives, seeing when archives are loaded, and diagnosing mod load order or missing-file issues.
-
 
 ## Safety Notes
 
@@ -111,12 +114,16 @@ bin\x64\Release\TTDSConsoleLauncher.exe --watch-only --game "C:\Program Files (x
 - `hooks refresh`: re-apply hooks after new game DLLs/modules load
 - `mods check`: find mod archives inside disabled/quarantine-looking folders that may still be scanned
 - `console save [path]`: save the current console/log session as a `.txt` file
+- `reload`: find the newest quicksave/autosave/checkpoint/save candidate, prioritizing quick/autosaves first
+- `reload list`: list reload candidates from the save folder
 - `freecam`: toggle Relight's `FreeCameraOnlyMode` setting
 - `freecam on/off/status/path`: set or inspect Relight's freecam setting
 - `clear`: clear the console
 - `detach`: unload the hook DLL and close the console
 
 The current freecam command requires [TTDS Relighting](https://github.com/Telltale-Modding-Group/TTDS-Relighting) and edits `RelightMod\RelightConfiguration_Development.ini`. Relight reads that value when a scene initializes, so you still need to reload or load a scene before the camera changes apply. A true live toggle needs a runtime Lua bridge or direct camera backend hooks.
+
+The current `reload` command finds the safest reload candidate from the save folder, prioritizing quicksave, autosave, and checkpoint bundles before normal save-slot bundles. Live in-engine save loading is not attached yet, so it does not force the Telltale engine to load the bundle directly.
 
 ## License
 

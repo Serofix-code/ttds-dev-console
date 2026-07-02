@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <fstream>
@@ -177,6 +178,13 @@ bool CopyTextFile(const fs::path& source, const fs::path& destination) {
   output << "Saved from: " << WideToUtf8(source.wstring()) << "\n\n";
   output << input.rdbuf();
   return output.good();
+}
+
+fs::path SaveDirectoryPath() {
+  wchar_t userProfile[MAX_PATH]{};
+  const DWORD size = GetEnvironmentVariableW(L"USERPROFILE", userProfile, MAX_PATH);
+  if (size == 0 || size >= MAX_PATH) return {};
+  return fs::path(userProfile) / L"Documents" / L"Telltale Games" / L"The Walking Dead Definitive";
 }
 
 fs::path RelightDevelopmentConfigPath() {
@@ -363,6 +371,32 @@ std::wstring FileNameOnly(const std::wstring& path) {
   return path.substr(slash + 1);
 }
 
+std::wstring FormatFileTimeText(const FILETIME& fileTime) {
+  FILETIME localFileTime{};
+  SYSTEMTIME systemTime{};
+  FileTimeToLocalFileTime(&fileTime, &localFileTime);
+  FileTimeToSystemTime(&localFileTime, &systemTime);
+
+  wchar_t buffer[64]{};
+  swprintf_s(
+      buffer,
+      L"%04u-%02u-%02u %02u:%02u:%02u",
+      systemTime.wYear,
+      systemTime.wMonth,
+      systemTime.wDay,
+      systemTime.wHour,
+      systemTime.wMinute,
+      systemTime.wSecond);
+  return buffer;
+}
+
+uint64_t FileTimeValue(const FILETIME& fileTime) {
+  ULARGE_INTEGER value{};
+  value.LowPart = fileTime.dwLowDateTime;
+  value.HighPart = fileTime.dwHighDateTime;
+  return value.QuadPart;
+}
+
 std::wstring CompactPath(const std::wstring& path) {
   const std::wstring lower = ToLower(path);
   const std::wstring game = ToLower(fs::current_path().wstring());
@@ -481,6 +515,111 @@ std::wstring FormatFileEvent(const std::wstring& apiName, DWORD desiredAccess, D
             << path;
   }
   return message.str();
+}
+
+struct SaveCandidate {
+  fs::path path;
+  std::wstring kind;
+  int priority = 99;
+  uint64_t writeTimeValue = 0;
+  uintmax_t size = 0;
+  FILETIME writeTime{};
+};
+
+int SavePriority(const std::wstring& lowerName, std::wstring* kind) {
+  if (lowerName.find(L"quick") != std::wstring::npos) {
+    if (kind) *kind = L"quicksave";
+    return 0;
+  }
+  if (lowerName.find(L"autosave") != std::wstring::npos) {
+    if (kind) *kind = L"autosave";
+    return 1;
+  }
+  if (lowerName.find(L"checkpoint") != std::wstring::npos) {
+    if (kind) *kind = L"checkpoint";
+    return 2;
+  }
+  if (lowerName.find(L"saveslot") != std::wstring::npos) {
+    if (kind) *kind = L"save";
+    return 3;
+  }
+  return 99;
+}
+
+std::vector<SaveCandidate> FindSaveCandidates() {
+  std::vector<SaveCandidate> candidates;
+  const fs::path saveDir = SaveDirectoryPath();
+  if (saveDir.empty() || !fs::exists(saveDir)) return candidates;
+
+  std::error_code error;
+  for (const auto& entry : fs::directory_iterator(saveDir, error)) {
+    if (error) break;
+    if (!entry.is_regular_file(error)) continue;
+
+    const fs::path path = entry.path();
+    if (_wcsicmp(path.extension().c_str(), L".bundle") != 0) continue;
+
+    const std::wstring lowerName = ToLower(path.filename().wstring());
+    if (lowerName == L"menu.bundle" || lowerName == L"global.bundle") continue;
+
+    std::wstring kind;
+    const int priority = SavePriority(lowerName, &kind);
+    if (priority >= 99) continue;
+
+    WIN32_FILE_ATTRIBUTE_DATA attributes{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attributes)) continue;
+
+    SaveCandidate candidate;
+    candidate.path = path;
+    candidate.kind = kind;
+    candidate.priority = priority;
+    candidate.writeTime = attributes.ftLastWriteTime;
+    candidate.writeTimeValue = FileTimeValue(attributes.ftLastWriteTime);
+    candidate.size = entry.file_size(error);
+    candidates.push_back(candidate);
+  }
+
+  std::sort(candidates.begin(), candidates.end(), [](const SaveCandidate& left, const SaveCandidate& right) {
+    if (left.priority != right.priority) return left.priority < right.priority;
+    return left.writeTimeValue > right.writeTimeValue;
+  });
+  return candidates;
+}
+
+void PrintSaveCandidate(const SaveCandidate& candidate, size_t index) {
+  std::wcout << L"  " << index << L". [" << candidate.kind << L"] "
+             << candidate.path.filename().wstring()
+             << L" | " << FormatFileTimeText(candidate.writeTime)
+             << L" | " << candidate.size << L" bytes\n";
+}
+
+void HandleReloadCommand(const std::string& sub) {
+  std::vector<SaveCandidate> candidates = FindSaveCandidates();
+  const fs::path saveDir = SaveDirectoryPath();
+  if (candidates.empty()) {
+    std::wcout << L"No quicksave/autosave/checkpoint/save bundles found in: " << saveDir << L"\n";
+    LogLine(L"reload", L"no save candidates found in " + saveDir.wstring());
+    return;
+  }
+
+  if (sub == "list") {
+    std::wcout << L"Reload candidates from: " << saveDir << L"\n";
+    const size_t count = std::min<size_t>(candidates.size(), 12);
+    for (size_t i = 0; i < count; ++i) {
+      PrintSaveCandidate(candidates[i], i + 1);
+    }
+    if (candidates.size() > count) {
+      std::wcout << L"  ... " << (candidates.size() - count) << L" more\n";
+    }
+    return;
+  }
+
+  const SaveCandidate& candidate = candidates.front();
+  std::wcout << L"Newest reload candidate:\n";
+  PrintSaveCandidate(candidate, 1);
+  std::wcout << L"Path: " << candidate.path << L"\n";
+  std::wcout << L"Live save loading is not attached yet; this command currently finds the safest candidate first.\n";
+  LogLine(L"reload", L"candidate " + candidate.kind + L" " + candidate.path.wstring());
 }
 
 std::vector<HMODULE> GetProcessModules() {
@@ -686,6 +825,8 @@ void PrintHelp() {
       << "  hooks refresh    Re-apply file/debug hooks to newly loaded modules\n"
       << "  mods check  Find mod archives in folders that may still be scanned\n"
       << "  console save [path]  Save this session log as a .txt file\n"
+      << "  reload    Find newest quicksave/autosave/checkpoint/save\n"
+      << "  reload list  List reload candidates\n"
       << "  freecam   Toggle Relight freecam INI setting\n"
       << "  freecam on/off/status/path\n"
       << "  clear     Clear this console\n"
@@ -902,6 +1043,9 @@ DWORD WINAPI ConsoleThread(void*) {
       } else {
         std::cout << "Unknown console command. Try: console save [path]\n";
       }
+    } else if (verb == "reload") {
+      const std::string sub = parts.size() > 1 ? ToLowerAscii(parts[1]) : "";
+      HandleReloadCommand(sub);
     } else if (verb == "freecam") {
       const std::string sub = parts.size() > 1 ? ToLowerAscii(parts[1]) : "";
       if (sub == "on") {
