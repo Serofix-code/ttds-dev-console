@@ -44,6 +44,22 @@ Texture and camera logging is currently resource/file-level telemetry. It can sh
 
 When you run `log on`, the console switches to its verbose default: focus `all`, file tracing on, write tracing on, texture/camera resource tracing on, debug-string tracing on, and failures-only mode off. You can narrow it afterward with commands like `log focus saves`, `log focus textures`, or `log failures on`.
 
+## Console Colour Codes
+
+The live console uses Windows console colour attributes:
+
+| Colour | Code | Meaning |
+| --- | --- | --- |
+| Bright red | `0x0C` | failures and errors |
+| Bright yellow | `0x0E` | save, prefs, and write activity |
+| Bright cyan | `0x0B` | camera-named resource/file activity |
+| Bright magenta | `0x0D` | texture and txmesh resource activity |
+| Bright green | `0x0A` | archive activity |
+| Bright white | `0x0F` | mods, Relight, and freecam |
+| Gray/default | `0x07` | debug strings and ordinary lines |
+
+The `[camera]` category does not mean live camera movement is hooked yet. It only appears when the game opens/writes camera-named resources or emits camera-related debug strings. Live camera position, FOV, and freecam movement need a Telltale engine/Lua hook or a graphics camera backend hook.
+
 ## Safety Notes
 
 - This is for local single-player modding/testing only.
@@ -109,6 +125,7 @@ bin\x64\Release\TTDSConsoleLauncher.exe --watch-only --game "C:\Program Files (x
 ## Console Commands
 
 - `help`: show commands
+- `colors` / `colours`: show the colour code legend
 - `status`: show process/module info
 - `where`: show current directory
 - `archives`: count files in the `Archives` folder

@@ -94,6 +94,56 @@ std::string ToLowerAscii(std::string value) {
   return value;
 }
 
+WORD LogColorFor(const std::wstring& category, const std::wstring& message, WORD originalColor) {
+  const std::wstring lowerCategory = ToLowerCopy(category);
+  const std::wstring lowerMessage = ToLowerCopy(message);
+  if (lowerMessage.find(L"fail") != std::wstring::npos || lowerCategory == L"error") {
+    return FOREGROUND_RED | FOREGROUND_INTENSITY;
+  }
+  if (lowerCategory == L"save" || lowerCategory == L"write" || lowerMessage.find(L" save") != std::wstring::npos || lowerMessage.find(L"prefs") != std::wstring::npos) {
+    return FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY;
+  }
+  if (lowerCategory == L"camera") {
+    return FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY;
+  }
+  if (lowerCategory == L"texture") {
+    return FOREGROUND_RED | FOREGROUND_BLUE | FOREGROUND_INTENSITY;
+  }
+  if (lowerCategory == L"archive") {
+    return FOREGROUND_GREEN | FOREGROUND_INTENSITY;
+  }
+  if (lowerCategory == L"mod" || lowerCategory == L"relight" || lowerCategory == L"freecam") {
+    return FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY;
+  }
+  if (lowerCategory == L"debug") {
+    return FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+  }
+  return originalColor;
+}
+
+void PrintColoredLine(WORD color, const std::wstring& text) {
+  const HANDLE console = GetStdHandle(STD_OUTPUT_HANDLE);
+  CONSOLE_SCREEN_BUFFER_INFO info{};
+  const bool hasConsoleInfo = console != INVALID_HANDLE_VALUE && GetConsoleScreenBufferInfo(console, &info);
+  const WORD originalColor = hasConsoleInfo ? info.wAttributes : static_cast<WORD>(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
+  if (hasConsoleInfo) SetConsoleTextAttribute(console, color);
+  std::wcout << text << L"\n";
+  if (hasConsoleInfo) SetConsoleTextAttribute(console, originalColor);
+}
+
+void PrintColorLegend() {
+  std::wcout << L"\nColour codes:\n";
+  PrintColoredLine(FOREGROUND_RED | FOREGROUND_INTENSITY, L"  bright red    0x0C  failures and errors");
+  PrintColoredLine(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY, L"  bright yellow 0x0E  save/prefs/write activity");
+  PrintColoredLine(FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY, L"  bright cyan   0x0B  camera-named resource file activity");
+  PrintColoredLine(FOREGROUND_RED | FOREGROUND_BLUE | FOREGROUND_INTENSITY, L"  bright magenta 0x0D texture/txmesh resource activity");
+  PrintColoredLine(FOREGROUND_GREEN | FOREGROUND_INTENSITY, L"  bright green  0x0A  archive activity");
+  PrintColoredLine(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY, L"  bright white  0x0F  mods, Relight, and freecam");
+  PrintColoredLine(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE, L"  gray/default  0x07  debug strings and ordinary lines");
+  std::wcout << L"Camera note: [camera] currently means camera-related resource/file activity only.\n";
+  std::wcout << L"Live camera movement, FOV, and freecam movement need an engine/Lua or graphics camera hook.\n";
+}
+
 std::wstring FocusModeText(int mode) {
   switch (mode) {
     case 0: return L"all";
@@ -183,24 +233,7 @@ void LogLine(const std::wstring& category, const std::wstring& message) {
     CONSOLE_SCREEN_BUFFER_INFO info{};
     const bool hasConsoleInfo = console != INVALID_HANDLE_VALUE && GetConsoleScreenBufferInfo(console, &info);
     const WORD originalColor = hasConsoleInfo ? info.wAttributes : static_cast<WORD>(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
-    const std::wstring lowerCategory = ToLowerCopy(category);
-    const std::wstring lowerMessage = ToLowerCopy(message);
-    WORD color = originalColor;
-    if (lowerMessage.find(L"fail") != std::wstring::npos || lowerCategory == L"error") {
-      color = FOREGROUND_RED | FOREGROUND_INTENSITY;
-    } else if (lowerCategory == L"save" || lowerCategory == L"write" || lowerMessage.find(L" save") != std::wstring::npos || lowerMessage.find(L"prefs") != std::wstring::npos) {
-      color = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY;
-    } else if (lowerCategory == L"camera") {
-      color = FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY;
-    } else if (lowerCategory == L"texture") {
-      color = FOREGROUND_RED | FOREGROUND_BLUE | FOREGROUND_INTENSITY;
-    } else if (lowerCategory == L"archive") {
-      color = FOREGROUND_GREEN | FOREGROUND_INTENSITY;
-    } else if (lowerCategory == L"mod" || lowerCategory == L"relight" || lowerCategory == L"freecam") {
-      color = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY;
-    } else if (lowerCategory == L"debug") {
-      color = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
-    }
+    const WORD color = LogColorFor(category, message, originalColor);
     if (hasConsoleInfo) SetConsoleTextAttribute(console, color);
     fwprintf(stdout, L"\n%ls\n", line.c_str());
     if (hasConsoleInfo) SetConsoleTextAttribute(console, originalColor);
@@ -565,6 +598,23 @@ std::wstring LogCategoryForPath(const std::wstring& path, const std::wstring& fa
   if (IsArchivePath(lower)) return L"archive";
   if (IsResourcePathLower(lower)) return L"resource";
   return fallback;
+}
+
+std::wstring LogCategoryForDebugMessage(const std::wstring& message) {
+  const std::wstring lower = ToLower(message);
+  if (IsCameraPathLower(lower) ||
+      lower.find(L" fov") != std::wstring::npos ||
+      lower.find(L"fieldofview") != std::wstring::npos ||
+      lower.find(L"viewmatrix") != std::wstring::npos ||
+      lower.find(L"projectionmatrix") != std::wstring::npos) {
+    return L"camera";
+  }
+  if (IsTexturePathLower(lower)) return L"texture";
+  if (IsRelightPath(lower)) return L"relight";
+  if (IsModPath(lower)) return L"mod";
+  if (IsArchivePath(lower)) return L"archive";
+  if (IsSaveOrPrefsPath(lower)) return L"save";
+  return L"debug";
 }
 
 bool IsBootArchiveScanNoise(const std::wstring& lower) {
@@ -999,7 +1049,7 @@ VOID WINAPI HookOutputDebugStringW(LPCWSTR message) {
   }
   if (!g_insideHook && g_logEnabled && g_debugStringTraceEnabled && message) {
     g_insideHook = true;
-    LogLine(L"debug", message);
+    LogLine(LogCategoryForDebugMessage(message), message);
     g_insideHook = false;
   }
   g_realOutputDebugStringW(message);
@@ -1011,7 +1061,8 @@ VOID WINAPI HookOutputDebugStringA(LPCSTR message) {
   }
   if (!g_insideHook && g_logEnabled && g_debugStringTraceEnabled && message) {
     g_insideHook = true;
-    LogLine(L"debug", Utf8ToWide(message));
+    const std::wstring wideMessage = Utf8ToWide(message);
+    LogLine(LogCategoryForDebugMessage(wideMessage), wideMessage);
     g_insideHook = false;
   }
   g_realOutputDebugStringA(message);
@@ -1055,6 +1106,8 @@ void PrintHelp() {
   std::cout
       << "Commands:\n"
       << "  help      Show this help\n"
+      << "  colors    Show colour code legend\n"
+      << "  colours   Show colour code legend\n"
       << "  status    Show process and hook info\n"
       << "  where     Show current working directory\n"
       << "  archives  Count files in the Archives folder\n"
@@ -1082,6 +1135,7 @@ void PrintHelp() {
       << "  freecam on/off/status/path\n"
       << "  clear     Clear this console\n"
       << "  detach    Unload the hook DLL and close this console\n";
+  PrintColorLegend();
 }
 
 void PrintStatus() {
@@ -1237,7 +1291,7 @@ DWORD WINAPI ConsoleThread(void*) {
   const int patchedImports = InstallHooks();
 
   std::cout << "TTDS Dev Console injected.\n";
-  std::cout << "This is v0.1.4: console, command loop, colored verbose logging, freecam state.\n";
+  std::cout << "This is v0.1.5: console, command loop, colored verbose logging, freecam state.\n";
   std::cout << "Hooked import entries: " << patchedImports << "\n";
   PrintHelp();
 
@@ -1250,6 +1304,8 @@ DWORD WINAPI ConsoleThread(void*) {
 
     if (verb == "help") {
       PrintHelp();
+    } else if (verb == "colors" || verb == "colours") {
+      PrintColorLegend();
     } else if (verb == "status") {
       PrintStatus();
     } else if (verb == "where") {
