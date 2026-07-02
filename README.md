@@ -2,7 +2,7 @@
 
 Experimental injected dev console for **The Walking Dead: The Telltale Definitive Series**.
 
-This is a first proof-of-concept. It launches `WDC.exe`, watches the game's startup handoff, injects `TTDSConsoleHook.dll` into the active game process, and opens a visible console window inside the game.
+This is an early proof-of-concept. It launches `WDC.exe`, watches the game's startup handoff, injects `TTDSConsoleHook.dll` into the active game process, and opens a visible console window inside the game.
 
 ## Safety Notes
 
@@ -42,8 +42,20 @@ If the console appears and then disappears during the loading screen, that usual
 - `status`: show process/module info
 - `where`: show current directory
 - `archives`: count files in the `Archives` folder
+- `log`: show log status
+- `log on`: start writing `ttds-dev-console.log` in the game folder
+- `log off`: stop writing new log entries
+- `log path`: print the log file path
+- `log mark <text>`: add a marker while testing a scene/menu/action
+- `log files on/off`: enable or disable file-open tracing
+- `log debug on/off`: enable or disable `OutputDebugString` tracing
+- `hooks refresh`: re-apply hooks after new game DLLs/modules load
+- `freecam`: toggle the freecam request flag
+- `freecam on/off/status`: set or inspect the freecam request flag
 - `clear`: clear the console
 - `detach`: unload the hook DLL and close the console
+
+The current freecam command is plumbing only: it toggles and logs the requested state, but the real Telltale camera backend still needs to be identified and wired.
 
 ## Roadmap
 

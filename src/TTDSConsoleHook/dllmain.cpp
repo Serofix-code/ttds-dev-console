@@ -1,18 +1,342 @@
 #include <windows.h>
+#include <tlhelp32.h>
 
+#include <atomic>
+#include <cstdio>
 #include <filesystem>
 #include <iostream>
+#include <mutex>
+#include <sstream>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
 namespace {
 HMODULE g_module = nullptr;
+std::atomic_bool g_logEnabled{false};
+std::atomic_bool g_fileTraceEnabled{true};
+std::atomic_bool g_debugStringTraceEnabled{true};
+std::atomic_bool g_freecamEnabled{false};
+std::mutex g_logMutex;
+FILE* g_logFile = nullptr;
+fs::path g_logPath;
+
+using CreateFileWFn = HANDLE(WINAPI*)(
+    LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+using CreateFileAFn = HANDLE(WINAPI*)(
+    LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+using OutputDebugStringWFn = VOID(WINAPI*)(LPCWSTR);
+using OutputDebugStringAFn = VOID(WINAPI*)(LPCSTR);
+
+CreateFileWFn g_realCreateFileW = nullptr;
+CreateFileAFn g_realCreateFileA = nullptr;
+OutputDebugStringWFn g_realOutputDebugStringW = nullptr;
+OutputDebugStringAFn g_realOutputDebugStringA = nullptr;
+thread_local bool g_insideHook = false;
 
 std::wstring GetModulePath(HMODULE module) {
   wchar_t path[MAX_PATH]{};
   GetModuleFileNameW(module, path, MAX_PATH);
   return path;
+}
+
+std::wstring Utf8ToWide(const std::string& value) {
+  if (value.empty()) return L"";
+  const int size = MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, nullptr, 0);
+  if (size <= 0) return L"";
+  std::wstring result(static_cast<size_t>(size - 1), L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, result.data(), size);
+  return result;
+}
+
+std::string WideToUtf8(const std::wstring& value) {
+  if (value.empty()) return "";
+  const int size = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, nullptr, 0, nullptr, nullptr);
+  if (size <= 0) return "";
+  std::string result(static_cast<size_t>(size - 1), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, result.data(), size, nullptr, nullptr);
+  return result;
+}
+
+std::wstring ToLower(std::wstring value) {
+  for (wchar_t& ch : value) {
+    ch = static_cast<wchar_t>(towlower(ch));
+  }
+  return value;
+}
+
+std::string ToLowerAscii(std::string value) {
+  for (char& ch : value) {
+    ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+  }
+  return value;
+}
+
+std::wstring NowText() {
+  SYSTEMTIME time{};
+  GetLocalTime(&time);
+  wchar_t buffer[64]{};
+  swprintf_s(
+      buffer,
+      L"%04u-%02u-%02u %02u:%02u:%02u.%03u",
+      time.wYear,
+      time.wMonth,
+      time.wDay,
+      time.wHour,
+      time.wMinute,
+      time.wSecond,
+      time.wMilliseconds);
+  return buffer;
+}
+
+void OpenLogFile() {
+  std::lock_guard<std::mutex> lock(g_logMutex);
+  if (g_logFile) return;
+
+  g_logPath = fs::current_path() / L"ttds-dev-console.log";
+  _wfopen_s(&g_logFile, g_logPath.c_str(), L"a, ccs=UTF-8");
+  if (g_logFile) {
+    fwprintf(g_logFile, L"\n[%ls] ===== TTDS Dev Console attached to PID %lu =====\n", NowText().c_str(), GetCurrentProcessId());
+    fflush(g_logFile);
+  }
+}
+
+void CloseLogFile() {
+  std::lock_guard<std::mutex> lock(g_logMutex);
+  if (!g_logFile) return;
+  fwprintf(g_logFile, L"[%ls] ===== TTDS Dev Console detached =====\n", NowText().c_str());
+  fclose(g_logFile);
+  g_logFile = nullptr;
+}
+
+void LogLine(const std::wstring& category, const std::wstring& message) {
+  if (!g_logFile) return;
+  std::lock_guard<std::mutex> lock(g_logMutex);
+  if (!g_logFile) return;
+  fwprintf(g_logFile, L"[%ls] [%ls] %ls\n", NowText().c_str(), category.c_str(), message.c_str());
+  fflush(g_logFile);
+}
+
+bool LooksInterestingPath(const std::wstring& path) {
+  const std::wstring lower = ToLower(path);
+  return lower.find(L"\\archives\\") != std::wstring::npos ||
+         lower.find(L"/archives/") != std::wstring::npos ||
+         lower.find(L".ttarch") != std::wstring::npos ||
+         lower.find(L".lua") != std::wstring::npos ||
+         lower.find(L".scene") != std::wstring::npos ||
+         lower.find(L".chore") != std::wstring::npos ||
+         lower.find(L".dlog") != std::wstring::npos ||
+         lower.find(L".prop") != std::wstring::npos ||
+         lower.find(L"save") != std::wstring::npos ||
+         lower.find(L"prefs") != std::wstring::npos;
+}
+
+std::wstring AccessText(DWORD desiredAccess) {
+  std::wstring text;
+  if (desiredAccess & GENERIC_READ) text += L"R";
+  if (desiredAccess & GENERIC_WRITE) text += L"W";
+  if (desiredAccess & GENERIC_EXECUTE) text += L"X";
+  if (desiredAccess & GENERIC_ALL) text += L"A";
+  if (text.empty()) text = L"0";
+  return text;
+}
+
+std::wstring DispositionText(DWORD creationDisposition) {
+  switch (creationDisposition) {
+    case CREATE_NEW: return L"CREATE_NEW";
+    case CREATE_ALWAYS: return L"CREATE_ALWAYS";
+    case OPEN_EXISTING: return L"OPEN_EXISTING";
+    case OPEN_ALWAYS: return L"OPEN_ALWAYS";
+    case TRUNCATE_EXISTING: return L"TRUNCATE_EXISTING";
+    default: return L"UNKNOWN";
+  }
+}
+
+std::vector<HMODULE> GetProcessModules() {
+  std::vector<HMODULE> modules;
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
+  if (snapshot == INVALID_HANDLE_VALUE) return modules;
+
+  MODULEENTRY32W entry{};
+  entry.dwSize = sizeof(entry);
+  if (Module32FirstW(snapshot, &entry)) {
+    do {
+      modules.push_back(entry.hModule);
+    } while (Module32NextW(snapshot, &entry));
+  }
+  CloseHandle(snapshot);
+  return modules;
+}
+
+bool PatchImport(HMODULE module, const char* importedModule, const char* functionName, void* replacement, void** original) {
+  if (!module || module == g_module) return false;
+
+  auto* base = reinterpret_cast<unsigned char*>(module);
+  auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+  if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+
+  auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+  if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+
+  const auto& directory = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+  if (!directory.VirtualAddress || !directory.Size) return false;
+
+  auto* imports = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + directory.VirtualAddress);
+  bool patched = false;
+  for (; imports->Name; ++imports) {
+    const char* moduleName = reinterpret_cast<const char*>(base + imports->Name);
+    if (_stricmp(moduleName, importedModule) != 0) continue;
+
+    auto* thunk = reinterpret_cast<IMAGE_THUNK_DATA*>(base + imports->FirstThunk);
+    auto* originalThunk = imports->OriginalFirstThunk
+        ? reinterpret_cast<IMAGE_THUNK_DATA*>(base + imports->OriginalFirstThunk)
+        : thunk;
+
+    for (; originalThunk->u1.AddressOfData && thunk->u1.Function; ++originalThunk, ++thunk) {
+      if (IMAGE_SNAP_BY_ORDINAL(originalThunk->u1.Ordinal)) continue;
+
+      auto* importByName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + originalThunk->u1.AddressOfData);
+      if (strcmp(reinterpret_cast<const char*>(importByName->Name), functionName) != 0) continue;
+
+      void* current = reinterpret_cast<void*>(thunk->u1.Function);
+      if (current == replacement) {
+        patched = true;
+        continue;
+      }
+      if (original && !*original) *original = current;
+
+      DWORD oldProtect = 0;
+      if (VirtualProtect(&thunk->u1.Function, sizeof(void*), PAGE_READWRITE, &oldProtect)) {
+        thunk->u1.Function = reinterpret_cast<ULONGLONG>(replacement);
+        DWORD ignored = 0;
+        VirtualProtect(&thunk->u1.Function, sizeof(void*), oldProtect, &ignored);
+        patched = true;
+      }
+    }
+  }
+
+  return patched;
+}
+
+HANDLE WINAPI HookCreateFileW(
+    LPCWSTR fileName,
+    DWORD desiredAccess,
+    DWORD shareMode,
+    LPSECURITY_ATTRIBUTES securityAttributes,
+    DWORD creationDisposition,
+    DWORD flagsAndAttributes,
+    HANDLE templateFile) {
+  if (!g_realCreateFileW) {
+    g_realCreateFileW = reinterpret_cast<CreateFileWFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "CreateFileW"));
+  }
+
+  HANDLE result = g_realCreateFileW(
+      fileName,
+      desiredAccess,
+      shareMode,
+      securityAttributes,
+      creationDisposition,
+      flagsAndAttributes,
+      templateFile);
+
+  if (!g_insideHook && g_logEnabled && g_fileTraceEnabled && fileName) {
+    g_insideHook = true;
+    const std::wstring path(fileName);
+    if (LooksInterestingPath(path)) {
+      std::wstringstream message;
+      message << L"CreateFileW " << AccessText(desiredAccess) << L" "
+              << DispositionText(creationDisposition) << L" -> "
+              << (result == INVALID_HANDLE_VALUE ? L"FAIL " : L"OK ")
+              << path;
+      LogLine(L"file", message.str());
+    }
+    g_insideHook = false;
+  }
+
+  return result;
+}
+
+HANDLE WINAPI HookCreateFileA(
+    LPCSTR fileName,
+    DWORD desiredAccess,
+    DWORD shareMode,
+    LPSECURITY_ATTRIBUTES securityAttributes,
+    DWORD creationDisposition,
+    DWORD flagsAndAttributes,
+    HANDLE templateFile) {
+  if (!g_realCreateFileA) {
+    g_realCreateFileA = reinterpret_cast<CreateFileAFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "CreateFileA"));
+  }
+
+  HANDLE result = g_realCreateFileA(
+      fileName,
+      desiredAccess,
+      shareMode,
+      securityAttributes,
+      creationDisposition,
+      flagsAndAttributes,
+      templateFile);
+
+  if (!g_insideHook && g_logEnabled && g_fileTraceEnabled && fileName) {
+    g_insideHook = true;
+    const std::wstring path = Utf8ToWide(fileName);
+    if (LooksInterestingPath(path)) {
+      std::wstringstream message;
+      message << L"CreateFileA " << AccessText(desiredAccess) << L" "
+              << DispositionText(creationDisposition) << L" -> "
+              << (result == INVALID_HANDLE_VALUE ? L"FAIL " : L"OK ")
+              << path;
+      LogLine(L"file", message.str());
+    }
+    g_insideHook = false;
+  }
+
+  return result;
+}
+
+VOID WINAPI HookOutputDebugStringW(LPCWSTR message) {
+  if (!g_realOutputDebugStringW) {
+    g_realOutputDebugStringW = reinterpret_cast<OutputDebugStringWFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "OutputDebugStringW"));
+  }
+  if (!g_insideHook && g_logEnabled && g_debugStringTraceEnabled && message) {
+    g_insideHook = true;
+    LogLine(L"debug", message);
+    g_insideHook = false;
+  }
+  g_realOutputDebugStringW(message);
+}
+
+VOID WINAPI HookOutputDebugStringA(LPCSTR message) {
+  if (!g_realOutputDebugStringA) {
+    g_realOutputDebugStringA = reinterpret_cast<OutputDebugStringAFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "OutputDebugStringA"));
+  }
+  if (!g_insideHook && g_logEnabled && g_debugStringTraceEnabled && message) {
+    g_insideHook = true;
+    LogLine(L"debug", Utf8ToWide(message));
+    g_insideHook = false;
+  }
+  g_realOutputDebugStringA(message);
+}
+
+int InstallHooks() {
+  g_realCreateFileW = reinterpret_cast<CreateFileWFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "CreateFileW"));
+  g_realCreateFileA = reinterpret_cast<CreateFileAFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "CreateFileA"));
+  g_realOutputDebugStringW = reinterpret_cast<OutputDebugStringWFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "OutputDebugStringW"));
+  g_realOutputDebugStringA = reinterpret_cast<OutputDebugStringAFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "OutputDebugStringA"));
+
+  int patched = 0;
+  for (HMODULE module : GetProcessModules()) {
+    patched += PatchImport(module, "KERNEL32.dll", "CreateFileW", reinterpret_cast<void*>(&HookCreateFileW), reinterpret_cast<void**>(&g_realCreateFileW)) ? 1 : 0;
+    patched += PatchImport(module, "KERNEL32.dll", "CreateFileA", reinterpret_cast<void*>(&HookCreateFileA), reinterpret_cast<void**>(&g_realCreateFileA)) ? 1 : 0;
+    patched += PatchImport(module, "KERNEL32.dll", "OutputDebugStringW", reinterpret_cast<void*>(&HookOutputDebugStringW), reinterpret_cast<void**>(&g_realOutputDebugStringW)) ? 1 : 0;
+    patched += PatchImport(module, "KERNEL32.dll", "OutputDebugStringA", reinterpret_cast<void*>(&HookOutputDebugStringA), reinterpret_cast<void**>(&g_realOutputDebugStringA)) ? 1 : 0;
+    patched += PatchImport(module, "KERNELBASE.dll", "CreateFileW", reinterpret_cast<void*>(&HookCreateFileW), reinterpret_cast<void**>(&g_realCreateFileW)) ? 1 : 0;
+    patched += PatchImport(module, "KERNELBASE.dll", "CreateFileA", reinterpret_cast<void*>(&HookCreateFileA), reinterpret_cast<void**>(&g_realCreateFileA)) ? 1 : 0;
+    patched += PatchImport(module, "KERNELBASE.dll", "OutputDebugStringW", reinterpret_cast<void*>(&HookOutputDebugStringW), reinterpret_cast<void**>(&g_realOutputDebugStringW)) ? 1 : 0;
+    patched += PatchImport(module, "KERNELBASE.dll", "OutputDebugStringA", reinterpret_cast<void*>(&HookOutputDebugStringA), reinterpret_cast<void**>(&g_realOutputDebugStringA)) ? 1 : 0;
+  }
+  return patched;
 }
 
 void AttachConsoleStreams() {
@@ -30,6 +354,14 @@ void PrintHelp() {
       << "  status    Show process and hook info\n"
       << "  where     Show current working directory\n"
       << "  archives  Count files in the Archives folder\n"
+      << "  log       Show log status\n"
+      << "  log on    Start writing ttds-dev-console.log\n"
+      << "  log off   Stop writing the log\n"
+      << "  log path  Print the log file path\n"
+      << "  log mark <text>  Add a marker to the log\n"
+      << "  hooks refresh    Re-apply file/debug hooks to newly loaded modules\n"
+      << "  freecam   Toggle freecam request state\n"
+      << "  freecam on/off/status\n"
       << "  clear     Clear this console\n"
       << "  detach    Unload the hook DLL and close this console\n";
 }
@@ -37,6 +369,9 @@ void PrintHelp() {
 void PrintStatus() {
   std::wcout << L"Process ID: " << GetCurrentProcessId() << L"\n";
   std::wcout << L"Hook DLL:   " << GetModulePath(g_module) << L"\n";
+  std::wcout << L"Log:        " << (g_logEnabled ? L"on" : L"off") << L"\n";
+  std::wcout << L"Log file:   " << g_logPath << L"\n";
+  std::wcout << L"Freecam:    " << (g_freecamEnabled ? L"requested/on" : L"off") << L"\n";
 }
 
 void CountArchives() {
@@ -54,39 +389,116 @@ void CountArchives() {
   std::wcout << L"File count: " << count << L"\n";
 }
 
+void PrintLogStatus() {
+  std::wcout << L"Log:        " << (g_logEnabled ? L"on" : L"off") << L"\n";
+  std::wcout << L"File trace: " << (g_fileTraceEnabled ? L"on" : L"off") << L"\n";
+  std::wcout << L"Debug trace:" << (g_debugStringTraceEnabled ? L" on" : L" off") << L"\n";
+  std::wcout << L"Path:       " << g_logPath << L"\n";
+}
+
+void SetLogEnabled(bool enabled) {
+  OpenLogFile();
+  g_logEnabled = enabled;
+  LogLine(L"console", enabled ? L"log on" : L"log off");
+  std::cout << (enabled ? "Log enabled.\n" : "Log disabled.\n");
+  std::wcout << L"Path: " << g_logPath << L"\n";
+}
+
+void SetFreecam(bool enabled) {
+  g_freecamEnabled = enabled;
+  LogLine(L"freecam", enabled
+      ? L"freecam requested on; camera backend not attached yet"
+      : L"freecam requested off");
+  std::cout << (enabled ? "Freecam request is ON.\n" : "Freecam request is OFF.\n");
+  if (enabled) {
+    std::cout << "Camera backend is not attached yet; this currently logs/toggles state only.\n";
+  }
+}
+
+std::vector<std::string> SplitCommand(const std::string& command) {
+  std::istringstream stream(command);
+  std::vector<std::string> parts;
+  std::string part;
+  while (stream >> part) parts.push_back(part);
+  return parts;
+}
+
 DWORD WINAPI ConsoleThread(void*) {
   AllocConsole();
   SetConsoleTitleW(L"TTDS Dev Console");
   AttachConsoleStreams();
+  OpenLogFile();
+  const int patchedImports = InstallHooks();
 
   std::cout << "TTDS Dev Console injected.\n";
-  std::cout << "This is v0: console + command loop only, no game internals yet.\n";
+  std::cout << "This is v1: console, command loop, file/debug logging, freecam state.\n";
+  std::cout << "Hooked import entries: " << patchedImports << "\n";
   PrintHelp();
 
   std::string command;
   while (true) {
     std::cout << "\nttds> ";
     if (!std::getline(std::cin, command)) break;
+    const std::vector<std::string> parts = SplitCommand(command);
+    const std::string verb = parts.empty() ? "" : ToLowerAscii(parts[0]);
 
-    if (command == "help") {
+    if (verb == "help") {
       PrintHelp();
-    } else if (command == "status") {
+    } else if (verb == "status") {
       PrintStatus();
-    } else if (command == "where") {
+    } else if (verb == "where") {
       std::wcout << fs::current_path() << L"\n";
-    } else if (command == "archives") {
+    } else if (verb == "archives") {
       CountArchives();
-    } else if (command == "clear") {
+    } else if (verb == "log") {
+      const std::string sub = parts.size() > 1 ? ToLowerAscii(parts[1]) : "status";
+      if (sub == "on") {
+        SetLogEnabled(true);
+      } else if (sub == "off") {
+        SetLogEnabled(false);
+      } else if (sub == "path") {
+        std::wcout << g_logPath << L"\n";
+      } else if (sub == "mark") {
+        const size_t markAt = command.find("mark");
+        const std::string text = markAt == std::string::npos ? "" : command.substr(markAt + 4);
+        LogLine(L"mark", Utf8ToWide(text));
+        std::cout << "Marked.\n";
+      } else if (sub == "files") {
+        if (parts.size() > 2) g_fileTraceEnabled = ToLowerAscii(parts[2]) != "off";
+        PrintLogStatus();
+      } else if (sub == "debug") {
+        if (parts.size() > 2) g_debugStringTraceEnabled = ToLowerAscii(parts[2]) != "off";
+        PrintLogStatus();
+      } else {
+        PrintLogStatus();
+      }
+    } else if (verb == "hooks" && parts.size() > 1 && ToLowerAscii(parts[1]) == "refresh") {
+      const int patched = InstallHooks();
+      std::cout << "Hook refresh patched entries: " << patched << "\n";
+      LogLine(L"hooks", L"refresh");
+    } else if (verb == "freecam") {
+      const std::string sub = parts.size() > 1 ? ToLowerAscii(parts[1]) : "";
+      if (sub == "on") {
+        SetFreecam(true);
+      } else if (sub == "off") {
+        SetFreecam(false);
+      } else if (sub == "status") {
+        std::cout << "Freecam request is " << (g_freecamEnabled ? "ON" : "OFF") << ".\n";
+      } else {
+        SetFreecam(!g_freecamEnabled);
+      }
+    } else if (verb == "clear") {
       system("cls");
-    } else if (command == "detach" || command == "quit") {
+    } else if (verb == "detach" || verb == "quit") {
       break;
-    } else if (command.empty()) {
+    } else if (verb.empty()) {
       continue;
     } else {
       std::cout << "Unknown command. Type help.\n";
     }
   }
 
+  CloseLogFile();
   FreeConsole();
   FreeLibraryAndExitThread(g_module, 0);
   return 0;
@@ -102,4 +514,3 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
   }
   return TRUE;
 }
-
