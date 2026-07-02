@@ -21,6 +21,7 @@ std::atomic_bool g_logCompactEnabled{true};
 std::atomic_bool g_fileTraceEnabled{true};
 std::atomic_bool g_debugStringTraceEnabled{true};
 std::atomic_bool g_logFailuresOnly{false};
+std::atomic_int g_logFocusMode{1};
 std::atomic_bool g_freecamEnabled{false};
 std::mutex g_logMutex;
 FILE* g_logFile = nullptr;
@@ -76,6 +77,28 @@ std::string ToLowerAscii(std::string value) {
     ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
   }
   return value;
+}
+
+std::wstring FocusModeText(int mode) {
+  switch (mode) {
+    case 0: return L"all";
+    case 1: return L"useful";
+    case 2: return L"saves";
+    case 3: return L"relight";
+    case 4: return L"mods";
+    case 5: return L"archives";
+    default: return L"useful";
+  }
+}
+
+int ParseFocusMode(const std::string& value) {
+  const std::string lower = ToLowerAscii(value);
+  if (lower == "all" || lower == "verbose") return 0;
+  if (lower == "saves" || lower == "save") return 2;
+  if (lower == "relight" || lower == "freecam") return 3;
+  if (lower == "mods" || lower == "mod") return 4;
+  if (lower == "archives" || lower == "archive") return 5;
+  return 1;
 }
 
 std::wstring NowText() {
@@ -348,6 +371,69 @@ std::wstring FileKind(const std::wstring& path) {
   return L"file";
 }
 
+bool IsSaveOrPrefsPath(const std::wstring& lower) {
+  return lower.find(L"prefs.prop") != std::wstring::npos ||
+         lower.find(L".bundle") != std::wstring::npos ||
+         lower.find(L"save") != std::wstring::npos;
+}
+
+bool IsRelightPath(const std::wstring& lower) {
+  return lower.find(L"relight") != std::wstring::npos ||
+         lower.find(L"tlse") != std::wstring::npos;
+}
+
+bool IsModPath(const std::wstring& lower) {
+  return lower.find(L"debugloader") != std::wstring::npos ||
+         lower.find(L"loadanylevel") != std::wstring::npos ||
+         lower.find(L"serofix") != std::wstring::npos ||
+         lower.find(L"friendjames") != std::wstring::npos ||
+         lower.find(L"modinfo") != std::wstring::npos ||
+         lower.find(L"disabled_mods") != std::wstring::npos ||
+         lower.find(L"_serofix_disabled") != std::wstring::npos;
+}
+
+bool IsArchivePath(const std::wstring& lower) {
+  return lower.find(L"\\archives\\") != std::wstring::npos ||
+         lower.find(L"/archives/") != std::wstring::npos ||
+         lower.find(L".ttarch") != std::wstring::npos;
+}
+
+bool IsBootArchiveScanNoise(const std::wstring& lower) {
+  const std::wstring name = ToLower(FileNameOnly(lower));
+  return name.find(L"_resdesc_50_") == 0 ||
+         name.find(L"_resourcedescriptions") == 0 ||
+         name.find(L"_compressed.ttarch2") != std::wstring::npos ||
+         name.find(L"audio") != std::wstring::npos ||
+         name.find(L"chinese") != std::wstring::npos ||
+         name.find(L"french") != std::wstring::npos ||
+         name.find(L"german") != std::wstring::npos ||
+         name.find(L"italian") != std::wstring::npos ||
+         name.find(L"portuguese") != std::wstring::npos ||
+         name.find(L"russian") != std::wstring::npos ||
+         name.find(L"spanish") != std::wstring::npos;
+}
+
+bool ShouldLogFileEvent(const std::wstring& path, HANDLE result) {
+  if (!LooksInterestingPath(path)) return false;
+  if (g_logFailuresOnly && result != INVALID_HANDLE_VALUE) return false;
+
+  const std::wstring lower = ToLower(path);
+  const bool failed = result == INVALID_HANDLE_VALUE;
+  const int focus = g_logFocusMode.load();
+
+  if (focus == 0) return true;
+  if (focus == 2) return IsSaveOrPrefsPath(lower);
+  if (focus == 3) return failed || IsRelightPath(lower);
+  if (focus == 4) return failed || IsModPath(lower) || IsRelightPath(lower);
+  if (focus == 5) return IsArchivePath(lower);
+
+  return failed ||
+         IsSaveOrPrefsPath(lower) ||
+         IsRelightPath(lower) ||
+         IsModPath(lower) ||
+         (IsArchivePath(lower) && !IsBootArchiveScanNoise(lower));
+}
+
 std::wstring FormatFileEvent(const std::wstring& apiName, DWORD desiredAccess, DWORD creationDisposition, HANDLE result, const std::wstring& path) {
   const bool ok = result != INVALID_HANDLE_VALUE;
   std::wstringstream message;
@@ -356,6 +442,10 @@ std::wstring FormatFileEvent(const std::wstring& apiName, DWORD desiredAccess, D
             << AccessVerb(desiredAccess) << L" "
             << FileKind(path) << L"  "
             << CompactPath(path);
+    const std::wstring lower = ToLower(path);
+    if (IsModPath(lower) && (lower.find(L"disabled_mods") != std::wstring::npos || lower.find(L"_serofix_disabled") != std::wstring::npos)) {
+      message << L"  [disabled-folder-read]";
+    }
   } else {
     message << apiName << L" " << AccessText(desiredAccess) << L" "
             << DispositionText(creationDisposition) << L" -> "
@@ -455,7 +545,7 @@ HANDLE WINAPI HookCreateFileW(
   if (!g_insideHook && g_logEnabled && g_fileTraceEnabled && fileName) {
     g_insideHook = true;
     const std::wstring path(fileName);
-    if (LooksInterestingPath(path) && (!g_logFailuresOnly || result == INVALID_HANDLE_VALUE)) {
+    if (ShouldLogFileEvent(path, result)) {
       LogLine(L"file", FormatFileEvent(L"CreateFileW", desiredAccess, creationDisposition, result, path));
     }
     g_insideHook = false;
@@ -488,7 +578,7 @@ HANDLE WINAPI HookCreateFileA(
   if (!g_insideHook && g_logEnabled && g_fileTraceEnabled && fileName) {
     g_insideHook = true;
     const std::wstring path = Utf8ToWide(fileName);
-    if (LooksInterestingPath(path) && (!g_logFailuresOnly || result == INVALID_HANDLE_VALUE)) {
+    if (ShouldLogFileEvent(path, result)) {
       LogLine(L"file", FormatFileEvent(L"CreateFileA", desiredAccess, creationDisposition, result, path));
     }
     g_insideHook = false;
@@ -561,10 +651,12 @@ void PrintHelp() {
       << "  log off   Stop writing the log\n"
       << "  log console on/off  Show or hide live log lines in this console\n"
       << "  log format compact/full  Change file log readability\n"
+      << "  log focus useful/all/saves/relight/mods/archives\n"
       << "  log failures on/off  Only show failed file opens\n"
       << "  log path  Print the log file path\n"
       << "  log mark <text>  Add a marker to the log\n"
       << "  hooks refresh    Re-apply file/debug hooks to newly loaded modules\n"
+      << "  mods check  Find mod archives in folders that may still be scanned\n"
       << "  freecam   Toggle Relight freecam INI setting\n"
       << "  freecam on/off/status/path\n"
       << "  clear     Clear this console\n"
@@ -577,6 +669,7 @@ void PrintStatus() {
   std::wcout << L"Log:        " << (g_logEnabled ? L"on" : L"off") << L"\n";
   std::wcout << L"Live log:   " << (g_logConsoleEnabled ? L"console on" : L"console off") << L"\n";
   std::wcout << L"Log format: " << (g_logCompactEnabled ? L"compact" : L"full") << L"\n";
+  std::wcout << L"Focus:      " << FocusModeText(g_logFocusMode.load()) << L"\n";
   std::wcout << L"Failures:   " << (g_logFailuresOnly ? L"only" : L"all") << L"\n";
   std::wcout << L"Log file:   " << g_logPath << L"\n";
   bool relightFreecam = false;
@@ -604,10 +697,38 @@ void PrintLogStatus() {
   std::wcout << L"Log:        " << (g_logEnabled ? L"on" : L"off") << L"\n";
   std::wcout << L"Live log:   " << (g_logConsoleEnabled ? L"console on" : L"console off") << L"\n";
   std::wcout << L"Format:     " << (g_logCompactEnabled ? L"compact" : L"full") << L"\n";
+  std::wcout << L"Focus:      " << FocusModeText(g_logFocusMode.load()) << L"\n";
   std::wcout << L"Failures:   " << (g_logFailuresOnly ? L"only" : L"all") << L"\n";
   std::wcout << L"File trace: " << (g_fileTraceEnabled ? L"on" : L"off") << L"\n";
   std::wcout << L"Debug trace:" << (g_debugStringTraceEnabled ? L" on" : L" off") << L"\n";
   std::wcout << L"Path:       " << g_logPath << L"\n";
+}
+
+void CheckModFolders() {
+  const fs::path root = fs::current_path();
+  std::wcout << L"Checking for mod archives outside the root Archives folder...\n";
+  size_t suspicious = 0;
+
+  std::error_code error;
+  for (const auto& entry : fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied, error)) {
+    if (error) break;
+    if (!entry.is_regular_file(error)) continue;
+
+    const fs::path path = entry.path();
+    const std::wstring lower = ToLower(path.wstring());
+    if (lower.find(L".ttarch") == std::wstring::npos && lower.find(L"_resdesc_") == std::wstring::npos) continue;
+    if (lower.find(L"disabled") == std::wstring::npos && lower.find(L"quarantine") == std::wstring::npos && lower.find(L"_serofix_disabled") == std::wstring::npos) continue;
+
+    ++suspicious;
+    std::wcout << L"  " << path << L"\n";
+  }
+
+  if (suspicious == 0) {
+    std::wcout << L"No suspicious disabled/quarantine archive files found under the game folder.\n";
+  } else {
+    std::wcout << L"Found " << suspicious << L" archive/resource files in disabled/quarantine-looking folders.\n";
+    std::wcout << L"If the game reads them, rename the inner 'archives' folder or move the folder outside the game root.\n";
+  }
 }
 
 void SetLogEnabled(bool enabled) {
@@ -689,6 +810,9 @@ DWORD WINAPI ConsoleThread(void*) {
       } else if (sub == "format") {
         if (parts.size() > 2) g_logCompactEnabled = ToLowerAscii(parts[2]) != "full";
         PrintLogStatus();
+      } else if (sub == "focus") {
+        if (parts.size() > 2) g_logFocusMode = ParseFocusMode(parts[2]);
+        PrintLogStatus();
       } else if (sub == "failures") {
         if (parts.size() > 2) g_logFailuresOnly = ToLowerAscii(parts[2]) == "on" || ToLowerAscii(parts[2]) == "only";
         PrintLogStatus();
@@ -705,6 +829,13 @@ DWORD WINAPI ConsoleThread(void*) {
       const int patched = InstallHooks();
       std::cout << "Hook refresh patched entries: " << patched << "\n";
       LogLine(L"hooks", L"refresh");
+    } else if (verb == "mods") {
+      const std::string sub = parts.size() > 1 ? ToLowerAscii(parts[1]) : "check";
+      if (sub == "check") {
+        CheckModFolders();
+      } else {
+        std::cout << "Unknown mods command. Try: mods check\n";
+      }
     } else if (verb == "freecam") {
       const std::string sub = parts.size() > 1 ? ToLowerAscii(parts[1]) : "";
       if (sub == "on") {

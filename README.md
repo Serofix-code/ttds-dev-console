@@ -77,12 +77,14 @@ bin\x64\Release\TTDSConsoleLauncher.exe --watch-only --game "C:\Program Files (x
 - `log off`: stop writing new log entries
 - `log console on/off`: show or hide live log lines in the console
 - `log format compact/full`: switch between readable short file logs and raw Windows file-open logs
+- `log focus useful/all/saves/relight/mods/archives`: choose which file events are shown
 - `log failures on/off`: show all interesting file opens or only failed file opens
 - `log path`: print the log file path
 - `log mark <text>`: add a marker while testing a scene/menu/action
 - `log files on/off`: enable or disable file-open tracing
 - `log debug on/off`: enable or disable `OutputDebugString` tracing
 - `hooks refresh`: re-apply hooks after new game DLLs/modules load
+- `mods check`: find mod archives inside disabled/quarantine-looking folders that may still be scanned
 - `freecam`: toggle Relight's `FreeCameraOnlyMode` setting
 - `freecam on/off/status/path`: set or inspect Relight's freecam setting
 - `clear`: clear the console
