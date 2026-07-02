@@ -10,6 +10,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -21,23 +22,32 @@ std::atomic_bool g_logConsoleEnabled{true};
 std::atomic_bool g_logCompactEnabled{true};
 std::atomic_bool g_fileTraceEnabled{true};
 std::atomic_bool g_debugStringTraceEnabled{true};
+std::atomic_bool g_writeTraceEnabled{true};
+std::atomic_bool g_textureTraceEnabled{true};
+std::atomic_bool g_cameraTraceEnabled{true};
 std::atomic_bool g_logFailuresOnly{false};
 std::atomic_int g_logFocusMode{1};
 std::atomic_bool g_freecamEnabled{false};
 std::mutex g_logMutex;
+std::mutex g_handleMutex;
 FILE* g_logFile = nullptr;
 fs::path g_logPath;
 fs::path g_relightDevelopmentConfigPath;
+std::unordered_map<HANDLE, std::wstring> g_trackedHandles;
 
 using CreateFileWFn = HANDLE(WINAPI*)(
     LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 using CreateFileAFn = HANDLE(WINAPI*)(
     LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+using WriteFileFn = BOOL(WINAPI*)(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
+using CloseHandleFn = BOOL(WINAPI*)(HANDLE);
 using OutputDebugStringWFn = VOID(WINAPI*)(LPCWSTR);
 using OutputDebugStringAFn = VOID(WINAPI*)(LPCSTR);
 
 CreateFileWFn g_realCreateFileW = nullptr;
 CreateFileAFn g_realCreateFileA = nullptr;
+WriteFileFn g_realWriteFile = nullptr;
+CloseHandleFn g_realCloseHandle = nullptr;
 OutputDebugStringWFn g_realOutputDebugStringW = nullptr;
 OutputDebugStringAFn g_realOutputDebugStringA = nullptr;
 thread_local bool g_insideHook = false;
@@ -88,6 +98,9 @@ std::wstring FocusModeText(int mode) {
     case 3: return L"relight";
     case 4: return L"mods";
     case 5: return L"archives";
+    case 6: return L"textures";
+    case 7: return L"cameras";
+    case 8: return L"resources";
     default: return L"useful";
   }
 }
@@ -99,6 +112,9 @@ int ParseFocusMode(const std::string& value) {
   if (lower == "relight" || lower == "freecam") return 3;
   if (lower == "mods" || lower == "mod") return 4;
   if (lower == "archives" || lower == "archive") return 5;
+  if (lower == "textures" || lower == "texture" || lower == "tx") return 6;
+  if (lower == "cameras" || lower == "camera" || lower == "cam") return 7;
+  if (lower == "resources" || lower == "resource" || lower == "assets") return 8;
   return 1;
 }
 
@@ -323,6 +339,47 @@ bool SetRelightFreecamSetting(bool enabled, std::wstring* errorMessage) {
   return true;
 }
 
+bool IsTexturePathLower(const std::wstring& lower) {
+  return lower.find(L".d3dtx") != std::wstring::npos ||
+         lower.find(L".dds") != std::wstring::npos ||
+         lower.find(L".png") != std::wstring::npos ||
+         lower.find(L".jpg") != std::wstring::npos ||
+         lower.find(L".jpeg") != std::wstring::npos ||
+         lower.find(L".tga") != std::wstring::npos ||
+         lower.find(L".bmp") != std::wstring::npos ||
+         lower.find(L"txmesh") != std::wstring::npos ||
+         lower.find(L"texture") != std::wstring::npos ||
+         lower.find(L"\\textures\\") != std::wstring::npos ||
+         lower.find(L"/textures/") != std::wstring::npos;
+}
+
+bool IsMeshPathLower(const std::wstring& lower) {
+  return lower.find(L".d3dmesh") != std::wstring::npos ||
+         lower.find(L".mesh") != std::wstring::npos ||
+         lower.find(L"_skl") != std::wstring::npos ||
+         lower.find(L"_skeleton") != std::wstring::npos ||
+         lower.find(L"\\meshes\\") != std::wstring::npos ||
+         lower.find(L"/meshes/") != std::wstring::npos;
+}
+
+bool IsCameraPathLower(const std::wstring& lower) {
+  return lower.find(L"camera") != std::wstring::npos ||
+         lower.find(L"cam_") != std::wstring::npos ||
+         lower.find(L"_cam") != std::wstring::npos ||
+         lower.find(L".cam") != std::wstring::npos ||
+         lower.find(L"cameracut") != std::wstring::npos ||
+         lower.find(L"lens") != std::wstring::npos;
+}
+
+bool IsResourcePathLower(const std::wstring& lower) {
+  return IsTexturePathLower(lower) ||
+         IsMeshPathLower(lower) ||
+         IsCameraPathLower(lower) ||
+         lower.find(L".scene") != std::wstring::npos ||
+         lower.find(L".chore") != std::wstring::npos ||
+         lower.find(L".dlog") != std::wstring::npos;
+}
+
 bool LooksInterestingPath(const std::wstring& path) {
   const std::wstring lower = ToLower(path);
   return lower.find(L"\\archives\\") != std::wstring::npos ||
@@ -333,6 +390,7 @@ bool LooksInterestingPath(const std::wstring& path) {
          lower.find(L".chore") != std::wstring::npos ||
          lower.find(L".dlog") != std::wstring::npos ||
          lower.find(L".prop") != std::wstring::npos ||
+         IsResourcePathLower(lower) ||
          lower.find(L"save") != std::wstring::npos ||
          lower.find(L"prefs") != std::wstring::npos;
 }
@@ -428,6 +486,9 @@ std::wstring FileKind(const std::wstring& path) {
   if (lower.find(L"\\archives\\") != std::wstring::npos || lower.find(L"/archives/") != std::wstring::npos || lower.find(L".ttarch") != std::wstring::npos) return L"archive";
   if (lower.find(L"prefs.prop") != std::wstring::npos) return L"prefs";
   if (lower.find(L"save") != std::wstring::npos || lower.find(L".bundle") != std::wstring::npos) return L"save";
+  if (IsTexturePathLower(lower)) return L"texture";
+  if (IsMeshPathLower(lower)) return L"mesh";
+  if (IsCameraPathLower(lower)) return L"camera";
   if (lower.find(L".lua") != std::wstring::npos) return L"lua";
   if (lower.find(L".prop") != std::wstring::npos) return L"prop";
   return L"file";
@@ -482,17 +543,27 @@ bool ShouldLogFileEvent(const std::wstring& path, HANDLE result) {
   const std::wstring lower = ToLower(path);
   const bool failed = result == INVALID_HANDLE_VALUE;
   const int focus = g_logFocusMode.load();
+  const bool texture = IsTexturePathLower(lower);
+  const bool camera = IsCameraPathLower(lower);
+
+  if (texture && !g_textureTraceEnabled) return false;
+  if (camera && !g_cameraTraceEnabled) return false;
 
   if (focus == 0) return true;
   if (focus == 2) return IsSaveOrPrefsPath(lower);
   if (focus == 3) return failed || IsRelightPath(lower);
   if (focus == 4) return failed || IsModPath(lower) || IsRelightPath(lower);
   if (focus == 5) return IsArchivePath(lower);
+  if (focus == 6) return failed || texture;
+  if (focus == 7) return failed || camera;
+  if (focus == 8) return failed || IsResourcePathLower(lower);
 
   return failed ||
          IsSaveOrPrefsPath(lower) ||
          IsRelightPath(lower) ||
          IsModPath(lower) ||
+         texture ||
+         camera ||
          (IsArchivePath(lower) && !IsBootArchiveScanNoise(lower));
 }
 
@@ -513,6 +584,75 @@ std::wstring FormatFileEvent(const std::wstring& apiName, DWORD desiredAccess, D
             << DispositionText(creationDisposition) << L" -> "
             << (ok ? L"OK " : L"FAIL ")
             << path;
+  }
+  return message.str();
+}
+
+bool ShouldTrackHandle(const std::wstring& path, HANDLE result) {
+  return result != INVALID_HANDLE_VALUE &&
+         result != nullptr &&
+         LooksInterestingPath(path);
+}
+
+void RememberHandle(HANDLE handle, const std::wstring& path) {
+  std::lock_guard<std::mutex> lock(g_handleMutex);
+  g_trackedHandles[handle] = path;
+}
+
+std::wstring ForgetHandle(HANDLE handle) {
+  std::lock_guard<std::mutex> lock(g_handleMutex);
+  const auto found = g_trackedHandles.find(handle);
+  if (found == g_trackedHandles.end()) return L"";
+  const std::wstring path = found->second;
+  g_trackedHandles.erase(found);
+  return path;
+}
+
+std::wstring PathForHandle(HANDLE handle) {
+  std::lock_guard<std::mutex> lock(g_handleMutex);
+  const auto found = g_trackedHandles.find(handle);
+  return found == g_trackedHandles.end() ? L"" : found->second;
+}
+
+bool ShouldLogWriteEvent(const std::wstring& path, BOOL ok) {
+  if (path.empty() || !LooksInterestingPath(path)) return false;
+  if (g_logFailuresOnly && ok) return false;
+
+  const std::wstring lower = ToLower(path);
+  const bool failed = !ok;
+  const bool texture = IsTexturePathLower(lower);
+  const bool camera = IsCameraPathLower(lower);
+  const int focus = g_logFocusMode.load();
+
+  if (texture && !g_textureTraceEnabled) return false;
+  if (camera && !g_cameraTraceEnabled) return false;
+
+  if (focus == 0) return true;
+  if (focus == 2) return IsSaveOrPrefsPath(lower);
+  if (focus == 3) return failed || IsRelightPath(lower);
+  if (focus == 4) return failed || IsModPath(lower) || IsRelightPath(lower);
+  if (focus == 5) return IsArchivePath(lower);
+  if (focus == 6) return failed || texture;
+  if (focus == 7) return failed || camera;
+  if (focus == 8) return failed || IsResourcePathLower(lower);
+
+  return failed ||
+         IsSaveOrPrefsPath(lower) ||
+         IsRelightPath(lower) ||
+         IsModPath(lower) ||
+         texture ||
+         camera;
+}
+
+std::wstring FormatWriteEvent(BOOL ok, DWORD requestedBytes, DWORD actualBytes, const std::wstring& path) {
+  std::wstringstream message;
+  message << (ok ? L"OK   " : L"FAIL ")
+          << L"WRITE "
+          << FileKind(path) << L"  "
+          << CompactPath(path)
+          << L"  bytes=" << actualBytes;
+  if (requestedBytes != actualBytes) {
+    message << L"/" << requestedBytes;
   }
   return message.str();
 }
@@ -709,13 +849,18 @@ HANDLE WINAPI HookCreateFileW(
       flagsAndAttributes,
       templateFile);
 
-  if (!g_insideHook && g_logEnabled && g_fileTraceEnabled && fileName) {
-    g_insideHook = true;
+  if (fileName) {
     const std::wstring path(fileName);
-    if (ShouldLogFileEvent(path, result)) {
-      LogLine(L"file", FormatFileEvent(L"CreateFileW", desiredAccess, creationDisposition, result, path));
+    if (ShouldTrackHandle(path, result)) {
+      RememberHandle(result, path);
     }
-    g_insideHook = false;
+    if (!g_insideHook && g_logEnabled && g_fileTraceEnabled) {
+      g_insideHook = true;
+      if (ShouldLogFileEvent(path, result)) {
+        LogLine(L"file", FormatFileEvent(L"CreateFileW", desiredAccess, creationDisposition, result, path));
+      }
+      g_insideHook = false;
+    }
   }
 
   return result;
@@ -742,16 +887,58 @@ HANDLE WINAPI HookCreateFileA(
       flagsAndAttributes,
       templateFile);
 
-  if (!g_insideHook && g_logEnabled && g_fileTraceEnabled && fileName) {
-    g_insideHook = true;
+  if (fileName) {
     const std::wstring path = Utf8ToWide(fileName);
-    if (ShouldLogFileEvent(path, result)) {
-      LogLine(L"file", FormatFileEvent(L"CreateFileA", desiredAccess, creationDisposition, result, path));
+    if (ShouldTrackHandle(path, result)) {
+      RememberHandle(result, path);
     }
-    g_insideHook = false;
+    if (!g_insideHook && g_logEnabled && g_fileTraceEnabled) {
+      g_insideHook = true;
+      if (ShouldLogFileEvent(path, result)) {
+        LogLine(L"file", FormatFileEvent(L"CreateFileA", desiredAccess, creationDisposition, result, path));
+      }
+      g_insideHook = false;
+    }
   }
 
   return result;
+}
+
+BOOL WINAPI HookWriteFile(
+    HANDLE file,
+    LPCVOID buffer,
+    DWORD numberOfBytesToWrite,
+    LPDWORD numberOfBytesWritten,
+    LPOVERLAPPED overlapped) {
+  if (!g_realWriteFile) {
+    g_realWriteFile = reinterpret_cast<WriteFileFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "WriteFile"));
+  }
+
+  const BOOL ok = g_realWriteFile(file, buffer, numberOfBytesToWrite, numberOfBytesWritten, overlapped);
+
+  if (!g_insideHook && g_logEnabled && g_writeTraceEnabled) {
+    const std::wstring path = PathForHandle(file);
+    if (ShouldLogWriteEvent(path, ok)) {
+      const DWORD actualBytes = numberOfBytesWritten ? *numberOfBytesWritten : (ok ? numberOfBytesToWrite : 0);
+      g_insideHook = true;
+      LogLine(L"write", FormatWriteEvent(ok, numberOfBytesToWrite, actualBytes, path));
+      g_insideHook = false;
+    }
+  }
+
+  return ok;
+}
+
+BOOL WINAPI HookCloseHandle(HANDLE object) {
+  if (!g_realCloseHandle) {
+    g_realCloseHandle = reinterpret_cast<CloseHandleFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "CloseHandle"));
+  }
+
+  const BOOL ok = g_realCloseHandle(object);
+  if (ok) {
+    ForgetHandle(object);
+  }
+  return ok;
 }
 
 VOID WINAPI HookOutputDebugStringW(LPCWSTR message) {
@@ -781,6 +968,8 @@ VOID WINAPI HookOutputDebugStringA(LPCSTR message) {
 int InstallHooks() {
   g_realCreateFileW = reinterpret_cast<CreateFileWFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "CreateFileW"));
   g_realCreateFileA = reinterpret_cast<CreateFileAFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "CreateFileA"));
+  g_realWriteFile = reinterpret_cast<WriteFileFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "WriteFile"));
+  g_realCloseHandle = reinterpret_cast<CloseHandleFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "CloseHandle"));
   g_realOutputDebugStringW = reinterpret_cast<OutputDebugStringWFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "OutputDebugStringW"));
   g_realOutputDebugStringA = reinterpret_cast<OutputDebugStringAFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "OutputDebugStringA"));
 
@@ -788,10 +977,14 @@ int InstallHooks() {
   for (HMODULE module : GetProcessModules()) {
     patched += PatchImport(module, "KERNEL32.dll", "CreateFileW", reinterpret_cast<void*>(&HookCreateFileW), reinterpret_cast<void**>(&g_realCreateFileW)) ? 1 : 0;
     patched += PatchImport(module, "KERNEL32.dll", "CreateFileA", reinterpret_cast<void*>(&HookCreateFileA), reinterpret_cast<void**>(&g_realCreateFileA)) ? 1 : 0;
+    patched += PatchImport(module, "KERNEL32.dll", "WriteFile", reinterpret_cast<void*>(&HookWriteFile), reinterpret_cast<void**>(&g_realWriteFile)) ? 1 : 0;
+    patched += PatchImport(module, "KERNEL32.dll", "CloseHandle", reinterpret_cast<void*>(&HookCloseHandle), reinterpret_cast<void**>(&g_realCloseHandle)) ? 1 : 0;
     patched += PatchImport(module, "KERNEL32.dll", "OutputDebugStringW", reinterpret_cast<void*>(&HookOutputDebugStringW), reinterpret_cast<void**>(&g_realOutputDebugStringW)) ? 1 : 0;
     patched += PatchImport(module, "KERNEL32.dll", "OutputDebugStringA", reinterpret_cast<void*>(&HookOutputDebugStringA), reinterpret_cast<void**>(&g_realOutputDebugStringA)) ? 1 : 0;
     patched += PatchImport(module, "KERNELBASE.dll", "CreateFileW", reinterpret_cast<void*>(&HookCreateFileW), reinterpret_cast<void**>(&g_realCreateFileW)) ? 1 : 0;
     patched += PatchImport(module, "KERNELBASE.dll", "CreateFileA", reinterpret_cast<void*>(&HookCreateFileA), reinterpret_cast<void**>(&g_realCreateFileA)) ? 1 : 0;
+    patched += PatchImport(module, "KERNELBASE.dll", "WriteFile", reinterpret_cast<void*>(&HookWriteFile), reinterpret_cast<void**>(&g_realWriteFile)) ? 1 : 0;
+    patched += PatchImport(module, "KERNELBASE.dll", "CloseHandle", reinterpret_cast<void*>(&HookCloseHandle), reinterpret_cast<void**>(&g_realCloseHandle)) ? 1 : 0;
     patched += PatchImport(module, "KERNELBASE.dll", "OutputDebugStringW", reinterpret_cast<void*>(&HookOutputDebugStringW), reinterpret_cast<void**>(&g_realOutputDebugStringW)) ? 1 : 0;
     patched += PatchImport(module, "KERNELBASE.dll", "OutputDebugStringA", reinterpret_cast<void*>(&HookOutputDebugStringA), reinterpret_cast<void**>(&g_realOutputDebugStringA)) ? 1 : 0;
   }
@@ -818,8 +1011,14 @@ void PrintHelp() {
       << "  log off   Stop writing the log\n"
       << "  log console on/off  Show or hide live log lines in this console\n"
       << "  log format compact/full  Change file log readability\n"
-      << "  log focus useful/all/saves/relight/mods/archives\n"
+      << "  log focus useful/all/saves/relight/mods/archives/textures/cameras/resources\n"
       << "  log failures on/off  Only show failed file opens\n"
+      << "  log files on/off  Track file-open activity\n"
+      << "  log writes on/off  Track actual writes to save/prefs/resource handles\n"
+      << "  log textures on/off  Track texture/txmesh resource file activity\n"
+      << "  log cameras on/off  Track camera-ish scene/chore resource file activity\n"
+      << "  log resources on/off  Toggle texture and camera resource activity together\n"
+      << "  log debug on/off  Track OutputDebugString messages\n"
       << "  log path  Print the log file path\n"
       << "  log mark <text>  Add a marker to the log\n"
       << "  hooks refresh    Re-apply file/debug hooks to newly loaded modules\n"
@@ -841,6 +1040,11 @@ void PrintStatus() {
   std::wcout << L"Log format: " << (g_logCompactEnabled ? L"compact" : L"full") << L"\n";
   std::wcout << L"Focus:      " << FocusModeText(g_logFocusMode.load()) << L"\n";
   std::wcout << L"Failures:   " << (g_logFailuresOnly ? L"only" : L"all") << L"\n";
+  std::wcout << L"File trace: " << (g_fileTraceEnabled ? L"on" : L"off") << L"\n";
+  std::wcout << L"Write trace:" << (g_writeTraceEnabled ? L" on" : L" off") << L"\n";
+  std::wcout << L"Textures:   " << (g_textureTraceEnabled ? L"on" : L"off") << L"\n";
+  std::wcout << L"Cameras:    " << (g_cameraTraceEnabled ? L"on" : L"off") << L"\n";
+  std::wcout << L"Debug trace:" << (g_debugStringTraceEnabled ? L" on" : L" off") << L"\n";
   std::wcout << L"Log file:   " << g_logPath << L"\n";
   bool relightFreecam = false;
   const bool hasRelightFreecam = GetRelightFreecamSetting(&relightFreecam);
@@ -870,6 +1074,9 @@ void PrintLogStatus() {
   std::wcout << L"Focus:      " << FocusModeText(g_logFocusMode.load()) << L"\n";
   std::wcout << L"Failures:   " << (g_logFailuresOnly ? L"only" : L"all") << L"\n";
   std::wcout << L"File trace: " << (g_fileTraceEnabled ? L"on" : L"off") << L"\n";
+  std::wcout << L"Write trace:" << (g_writeTraceEnabled ? L" on" : L" off") << L"\n";
+  std::wcout << L"Textures:   " << (g_textureTraceEnabled ? L"on" : L"off") << L"\n";
+  std::wcout << L"Cameras:    " << (g_cameraTraceEnabled ? L"on" : L"off") << L"\n";
   std::wcout << L"Debug trace:" << (g_debugStringTraceEnabled ? L" on" : L" off") << L"\n";
   std::wcout << L"Path:       " << g_logPath << L"\n";
 }
@@ -1013,6 +1220,22 @@ DWORD WINAPI ConsoleThread(void*) {
         PrintLogStatus();
       } else if (sub == "files") {
         if (parts.size() > 2) g_fileTraceEnabled = ToLowerAscii(parts[2]) != "off";
+        PrintLogStatus();
+      } else if (sub == "writes") {
+        if (parts.size() > 2) g_writeTraceEnabled = ToLowerAscii(parts[2]) != "off";
+        PrintLogStatus();
+      } else if (sub == "textures") {
+        if (parts.size() > 2) g_textureTraceEnabled = ToLowerAscii(parts[2]) != "off";
+        PrintLogStatus();
+      } else if (sub == "cameras") {
+        if (parts.size() > 2) g_cameraTraceEnabled = ToLowerAscii(parts[2]) != "off";
+        PrintLogStatus();
+      } else if (sub == "resources") {
+        if (parts.size() > 2) {
+          const bool enabled = ToLowerAscii(parts[2]) != "off";
+          g_textureTraceEnabled = enabled;
+          g_cameraTraceEnabled = enabled;
+        }
         PrintLogStatus();
       } else if (sub == "debug") {
         if (parts.size() > 2) g_debugStringTraceEnabled = ToLowerAscii(parts[2]) != "off";

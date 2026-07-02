@@ -9,7 +9,8 @@ This is an early proof-of-concept. It launches `WDC.exe`, watches the game's sta
 - injects a visible console into the active `WDC.exe` game process
 - can auto-watch for Steam-launched game sessions
 - logs readable file activity for saves, archives, Relight, and mods
-- helps modding by showing which `.ttarch2` archives, resource description scripts, save bundles, and mod files the game actually loads
+- logs actual writes to tracked save/prefs/resource files, including byte counts
+- helps modding by showing which `.ttarch2` archives, texture/txmesh resources, camera-ish scene/chore files, resource description scripts, save bundles, and mod files the game actually loads
 - can check for installed mod archives and flag disabled/quarantine folders that the game may still scan
 - can show failed file opens to help diagnose missing Relight files, mod conflicts, and other load issues
 - can save the console/log session to a `.txt` file
@@ -20,7 +21,7 @@ This is an early proof-of-concept. It launches `WDC.exe`, watches the game's sta
 
 - helps with modding/debugging by showing which `.ttarch2` archives the game actually reads during startup and gameplay, making it easier to see what loads, in what order, and whether a mod/archive is being detected
 
-The console can help with TTDS modding because it shows readable file activity while the game is running. This includes `.ttarch2` archive reads, save writes, Relight files, and mod-related file access.
+The console can help with TTDS modding because it shows readable file activity while the game is running. This includes `.ttarch2` archive reads, texture/txmesh resource activity, camera-ish scene/chore resource activity, save/prefs writes, Relight files, and mod-related file access.
 
 For example, archive log lines like these show which game archives are being loaded:
 
@@ -31,6 +32,14 @@ For example, archive log lines like these show which game archives are being loa
 ```
 
 This can be useful for checking whether the game is reading the expected episode archives, seeing when archives are loaded, and diagnosing mod load order or missing-file issues.
+
+Write log lines show when the game actually writes bytes to a tracked file:
+
+```txt
+[write] OK   WRITE prefs  saves\prefs.prop  bytes=853
+```
+
+Texture and camera logging is currently resource/file-level telemetry. It can show texture archives/resources and camera-ish scene/chore files being opened or written, but it does not yet read live engine camera position, FOV, or GPU material swaps directly.
 
 ## Safety Notes
 
@@ -105,11 +114,15 @@ bin\x64\Release\TTDSConsoleLauncher.exe --watch-only --game "C:\Program Files (x
 - `log off`: stop writing new log entries
 - `log console on/off`: show or hide live log lines in the console
 - `log format compact/full`: switch between readable short file logs and raw Windows file-open logs
-- `log focus useful/all/saves/relight/mods/archives`: choose which file events are shown
+- `log focus useful/all/saves/relight/mods/archives/textures/cameras/resources`: choose which file events are shown
 - `log failures on/off`: show all interesting file opens or only failed file opens
 - `log path`: print the log file path
 - `log mark <text>`: add a marker while testing a scene/menu/action
 - `log files on/off`: enable or disable file-open tracing
+- `log writes on/off`: enable or disable actual write tracing for tracked handles
+- `log textures on/off`: enable or disable texture/txmesh resource file tracing
+- `log cameras on/off`: enable or disable camera-ish resource file tracing
+- `log resources on/off`: enable or disable texture and camera resource tracing together
 - `log debug on/off`: enable or disable `OutputDebugString` tracing
 - `hooks refresh`: re-apply hooks after new game DLLs/modules load
 - `mods check`: find mod archives inside disabled/quarantine-looking folders that may still be scanned
