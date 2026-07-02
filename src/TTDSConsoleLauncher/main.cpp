@@ -1,8 +1,10 @@
 #include <windows.h>
 #include <tlhelp32.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <iostream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -16,7 +18,7 @@ void PrintUsage() {
   std::wcout
       << L"TTDSConsoleLauncher\n\n"
       << L"Usage:\n"
-      << L"  TTDSConsoleLauncher.exe [--game <game folder>] [--no-wait] [--allow-multiple]\n\n"
+      << L"  TTDSConsoleLauncher.exe [--game <game folder>] [--allow-multiple]\n\n"
       << L"Default game folder:\n"
       << L"  " << kDefaultGameDir << L"\n";
 }
@@ -33,6 +35,18 @@ bool HasFlag(const std::vector<std::wstring>& args, const std::wstring& name) {
     if (arg == name) return true;
   }
   return false;
+}
+
+std::wstring ToLower(std::wstring value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](wchar_t c) {
+    return static_cast<wchar_t>(towlower(c));
+  });
+  return value;
+}
+
+bool IsWdcImage(const std::wstring& path) {
+  if (path.empty()) return false;
+  return ToLower(fs::path(path).filename().wstring()) == L"wdc.exe";
 }
 
 bool IsProcessRunning(const std::wstring& exeName) {
@@ -163,6 +177,246 @@ bool InjectDll(HANDLE process, DWORD processId, const fs::path& dllPath) {
 
   return true;
 }
+
+bool InjectDllAsync(HANDLE process, DWORD processId, const fs::path& dllPath) {
+  const std::wstring dll = fs::absolute(dllPath).wstring();
+  const SIZE_T bytes = (dll.size() + 1) * sizeof(wchar_t);
+
+  void* remotePath = VirtualAllocEx(process, nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  if (!remotePath) {
+    std::wcerr << L"VirtualAllocEx failed for PID " << processId << L": " << GetLastErrorText(GetLastError()) << L"\n";
+    return false;
+  }
+
+  if (!WriteProcessMemory(process, remotePath, dll.c_str(), bytes, nullptr)) {
+    std::wcerr << L"WriteProcessMemory failed for PID " << processId << L": " << GetLastErrorText(GetLastError()) << L"\n";
+    VirtualFreeEx(process, remotePath, 0, MEM_RELEASE);
+    return false;
+  }
+
+  auto loadLibrary = reinterpret_cast<LPTHREAD_START_ROUTINE>(GetRemoteKernel32Proc(processId, "LoadLibraryW"));
+  if (!loadLibrary) {
+    std::wcerr << L"Could not find LoadLibraryW for PID " << processId << L".\n";
+    VirtualFreeEx(process, remotePath, 0, MEM_RELEASE);
+    return false;
+  }
+
+  HANDLE thread = CreateRemoteThread(process, nullptr, 0, loadLibrary, remotePath, 0, nullptr);
+  if (!thread) {
+    std::wcerr << L"CreateRemoteThread failed for PID " << processId << L": " << GetLastErrorText(GetLastError()) << L"\n";
+    VirtualFreeEx(process, remotePath, 0, MEM_RELEASE);
+    return false;
+  }
+
+  CloseHandle(thread);
+  return true;
+}
+
+std::wstring GetPathFromFileHandle(HANDLE file) {
+  if (!file || file == INVALID_HANDLE_VALUE) return L"";
+  wchar_t path[MAX_PATH * 4]{};
+  DWORD size = GetFinalPathNameByHandleW(file, path, static_cast<DWORD>(std::size(path)), FILE_NAME_NORMALIZED);
+  if (size == 0 || size >= std::size(path)) return L"";
+  std::wstring result(path);
+  constexpr const wchar_t* devicePrefix = L"\\\\?\\";
+  if (result.rfind(devicePrefix, 0) == 0) {
+    result.erase(0, 4);
+  }
+  return result;
+}
+
+struct DebugProcessInfo {
+  HANDLE process = nullptr;
+  ULONGLONG injectAfter = 0;
+  bool injected = false;
+  std::wstring imagePath;
+};
+
+std::wstring GetProcessImagePath(HANDLE process) {
+  wchar_t path[MAX_PATH * 4]{};
+  DWORD size = static_cast<DWORD>(std::size(path));
+  if (!QueryFullProcessImageNameW(process, 0, path, &size)) {
+    return L"";
+  }
+  return std::wstring(path, size);
+}
+
+void CleanupExitedProcesses(std::map<DWORD, DebugProcessInfo>& processes) {
+  for (auto it = processes.begin(); it != processes.end();) {
+    DWORD exitCode = 0;
+    if (it->second.process && GetExitCodeProcess(it->second.process, &exitCode) && exitCode != STILL_ACTIVE) {
+      CloseHandle(it->second.process);
+      it = processes.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+void ScanForWdcProcesses(std::map<DWORD, DebugProcessInfo>& processes) {
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snapshot == INVALID_HANDLE_VALUE) return;
+
+  PROCESSENTRY32W entry{};
+  entry.dwSize = sizeof(entry);
+  if (Process32FirstW(snapshot, &entry)) {
+    do {
+      if (_wcsicmp(entry.szExeFile, L"WDC.exe") != 0 || processes.find(entry.th32ProcessID) != processes.end()) {
+        continue;
+      }
+
+      HANDLE process = OpenProcess(
+          PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
+          FALSE,
+          entry.th32ProcessID);
+      if (!process) {
+        continue;
+      }
+
+      const std::wstring imagePath = GetProcessImagePath(process);
+      std::wcout << L"Found relaunched WDC.exe PID " << entry.th32ProcessID;
+      if (!imagePath.empty()) std::wcout << L" (" << imagePath << L")";
+      std::wcout << L"\n";
+
+      processes[entry.th32ProcessID] = DebugProcessInfo{
+          process,
+          GetTickCount64() + 250,
+          false,
+          imagePath};
+    } while (Process32NextW(snapshot, &entry));
+  }
+
+  CloseHandle(snapshot);
+}
+
+bool HasTrackedProcess(const std::map<DWORD, DebugProcessInfo>& processes) {
+  for (const auto& [pid, info] : processes) {
+    DWORD exitCode = 0;
+    if (info.process && GetExitCodeProcess(info.process, &exitCode) && exitCode == STILL_ACTIVE) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void TryPendingInjections(std::map<DWORD, DebugProcessInfo>& processes, const fs::path& dllPath) {
+  CleanupExitedProcesses(processes);
+  ScanForWdcProcesses(processes);
+
+  const ULONGLONG now = GetTickCount64();
+  for (auto& [pid, info] : processes) {
+    if (!info.process || info.injected || now < info.injectAfter) continue;
+
+    std::wcout << L"Injecting into WDC.exe PID " << pid;
+    if (!info.imagePath.empty()) std::wcout << L" (" << info.imagePath << L")";
+    std::wcout << L"\n";
+
+    info.injected = InjectDllAsync(info.process, pid, dllPath);
+    if (info.injected) {
+      std::wcout << L"Queued console DLL for PID " << pid << L".\n";
+    } else {
+      info.injectAfter = now + 1000;
+      std::wcerr << L"Will retry PID " << pid << L" in 1 second.\n";
+    }
+  }
+}
+
+int DebugLaunchAndInject(const fs::path& exePath, const fs::path& gameDir, const fs::path& dllPath) {
+  std::wstring commandLine = L"\"" + exePath.wstring() + L"\"";
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION processInfo{};
+
+  DebugSetProcessKillOnExit(FALSE);
+
+  std::wcout << L"Launching under relaunch watcher: " << exePath << L"\n";
+  BOOL created = CreateProcessW(
+      exePath.c_str(),
+      commandLine.data(),
+      nullptr,
+      nullptr,
+      FALSE,
+      DEBUG_PROCESS,
+      nullptr,
+      gameDir.c_str(),
+      &startup,
+      &processInfo);
+
+  if (!created) {
+    std::wcerr << L"CreateProcess failed: " << GetLastErrorText(GetLastError()) << L"\n";
+    return 1;
+  }
+
+  CloseHandle(processInfo.hThread);
+  CloseHandle(processInfo.hProcess);
+
+  std::map<DWORD, DebugProcessInfo> processes;
+  while (true) {
+    DEBUG_EVENT event{};
+    if (!WaitForDebugEvent(&event, 250)) {
+      const DWORD error = GetLastError();
+      if (error != ERROR_SEM_TIMEOUT) {
+        std::wcerr << L"Debug loop ended: " << GetLastErrorText(error) << L"\n";
+        break;
+      }
+      TryPendingInjections(processes, dllPath);
+      continue;
+    }
+
+    DWORD continueStatus = DBG_CONTINUE;
+    if (event.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT) {
+      const auto& info = event.u.CreateProcessInfo;
+      std::wstring imagePath = GetPathFromFileHandle(info.hFile);
+      if (info.hFile) CloseHandle(info.hFile);
+      if (info.hThread) CloseHandle(info.hThread);
+
+      if (IsWdcImage(imagePath)) {
+        std::wcout << L"Detected WDC.exe PID " << event.dwProcessId;
+        if (!imagePath.empty()) std::wcout << L" (" << imagePath << L")";
+        std::wcout << L"\n";
+        processes[event.dwProcessId] = DebugProcessInfo{
+            info.hProcess,
+            GetTickCount64() + 250,
+            false,
+            imagePath};
+      } else if (info.hProcess) {
+        CloseHandle(info.hProcess);
+      }
+    } else if (event.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT) {
+      auto found = processes.find(event.dwProcessId);
+      if (found != processes.end()) {
+        std::wcout << L"WDC.exe PID " << event.dwProcessId << L" exited.\n";
+        if (found->second.process) CloseHandle(found->second.process);
+        processes.erase(found);
+      }
+    } else if (event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
+      const DWORD code = event.u.Exception.ExceptionRecord.ExceptionCode;
+      if (code != EXCEPTION_BREAKPOINT && code != DBG_PRINTEXCEPTION_C && code != DBG_PRINTEXCEPTION_WIDE_C) {
+        continueStatus = DBG_EXCEPTION_NOT_HANDLED;
+      }
+    }
+
+    ContinueDebugEvent(event.dwProcessId, event.dwThreadId, continueStatus);
+    TryPendingInjections(processes, dllPath);
+  }
+
+  for (auto& [pid, info] : processes) {
+    if (info.process) CloseHandle(info.process);
+  }
+
+  std::wcout << L"Watching for WDC.exe relaunches for 60 seconds...\n";
+  processes.clear();
+  const ULONGLONG watchUntil = GetTickCount64() + 60000;
+  while (GetTickCount64() < watchUntil || HasTrackedProcess(processes)) {
+    TryPendingInjections(processes, dllPath);
+    Sleep(250);
+  }
+
+  for (auto& [pid, info] : processes) {
+    if (info.process) CloseHandle(info.process);
+  }
+  return 0;
+}
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -173,7 +427,6 @@ int wmain(int argc, wchar_t** argv) {
   }
 
   const fs::path gameDir = GetArgValue(args, L"--game", kDefaultGameDir);
-  const bool noWait = HasFlag(args, L"--no-wait");
   const bool allowMultiple = HasFlag(args, L"--allow-multiple");
   const fs::path dllPath = GetOwnDirectory() / L"TTDSConsoleHook.dll";
 
@@ -192,49 +445,5 @@ int wmain(int argc, wchar_t** argv) {
     return 1;
   }
 
-  std::wstring commandLine = L"\"" + exePath.wstring() + L"\"";
-  STARTUPINFOW startup{};
-  startup.cb = sizeof(startup);
-  PROCESS_INFORMATION processInfo{};
-
-  std::wcout << L"Launching suspended: " << exePath << L"\n";
-  BOOL created = CreateProcessW(
-      exePath.c_str(),
-      commandLine.data(),
-      nullptr,
-      nullptr,
-      FALSE,
-      CREATE_SUSPENDED,
-      nullptr,
-      gameDir.c_str(),
-      &startup,
-      &processInfo);
-
-  if (!created) {
-    std::wcerr << L"CreateProcess failed: " << GetLastErrorText(GetLastError()) << L"\n";
-    return 1;
-  }
-
-  std::wcout << L"WDC.exe PID: " << processInfo.dwProcessId << L"\n";
-  std::wcout << L"Injecting: " << dllPath << L"\n";
-  const bool injected = InjectDll(processInfo.hProcess, processInfo.dwProcessId, dllPath);
-  if (!injected) {
-    std::wcerr << L"Injection failed. Resuming game without the dev console.\n";
-    ResumeThread(processInfo.hThread);
-    CloseHandle(processInfo.hThread);
-    CloseHandle(processInfo.hProcess);
-    return 1;
-  }
-
-  std::wcout << L"Injected. Resuming game; the console window should appear shortly.\n";
-  ResumeThread(processInfo.hThread);
-  CloseHandle(processInfo.hThread);
-
-  if (!noWait) {
-    std::wcout << L"Waiting for WDC.exe to exit...\n";
-    WaitForSingleObject(processInfo.hProcess, INFINITE);
-  }
-
-  CloseHandle(processInfo.hProcess);
-  return 0;
+  return DebugLaunchAndInject(exePath, gameDir, dllPath);
 }

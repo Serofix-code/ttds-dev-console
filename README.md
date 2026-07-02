@@ -2,7 +2,7 @@
 
 Experimental injected dev console for **The Walking Dead: The Telltale Definitive Series**.
 
-This is a first proof-of-concept. It launches `WDC.exe`, injects `TTDSConsoleHook.dll`, and opens a visible console window inside the game process.
+This is a first proof-of-concept. It launches `WDC.exe`, watches the game's startup handoff, injects `TTDSConsoleHook.dll` into the active game process, and opens a visible console window inside the game.
 
 ## Safety Notes
 
@@ -32,7 +32,9 @@ bin\x64\Release\TTDSConsoleHook.dll
 bin\x64\Release\TTDSConsoleLauncher.exe --game "C:\Program Files (x86)\Steam\steamapps\common\The Walking Dead The Telltale Definitive Series"
 ```
 
-The launcher starts `WDC.exe`, injects the hook DLL, then waits for the game to close.
+The launcher starts `WDC.exe` under a relaunch watcher. Keep the launcher window open while the game starts; the first `WDC.exe` can hand off to another `WDC.exe`, and the watcher will inject again when that happens.
+
+If the console appears and then disappears during the loading screen, that usually means the first bootstrap process exited. Leave the launcher running and wait for the final game process to be detected.
 
 ## Console Commands
 
@@ -49,4 +51,3 @@ The launcher starts `WDC.exe`, injects the hook DLL, then waits for the game to 
 2. Add named-pipe communication between launcher and hook.
 3. Add file-based commands such as backup, restore, enable/disable mod packs.
 4. Investigate game scripting/scene functions only after the basic tool is stable.
-
