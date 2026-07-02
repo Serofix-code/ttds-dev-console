@@ -118,6 +118,22 @@ std::wstring NowText() {
   return buffer;
 }
 
+std::wstring FileTimestampText() {
+  SYSTEMTIME time{};
+  GetLocalTime(&time);
+  wchar_t buffer[64]{};
+  swprintf_s(
+      buffer,
+      L"%04u%02u%02u_%02u%02u%02u",
+      time.wYear,
+      time.wMonth,
+      time.wDay,
+      time.wHour,
+      time.wMinute,
+      time.wSecond);
+  return buffer;
+}
+
 void OpenLogFile() {
   std::lock_guard<std::mutex> lock(g_logMutex);
   if (g_logFile) return;
@@ -149,6 +165,18 @@ void LogLine(const std::wstring& category, const std::wstring& message) {
     fwprintf(g_logFile, L"%ls\n", line.c_str());
     fflush(g_logFile);
   }
+}
+
+bool CopyTextFile(const fs::path& source, const fs::path& destination) {
+  std::ifstream input(source, std::ios::binary);
+  if (!input) return false;
+  std::ofstream output(destination, std::ios::binary | std::ios::trunc);
+  if (!output) return false;
+
+  output << "TTDS Dev Console transcript\n";
+  output << "Saved from: " << WideToUtf8(source.wstring()) << "\n\n";
+  output << input.rdbuf();
+  return output.good();
 }
 
 fs::path RelightDevelopmentConfigPath() {
@@ -657,6 +685,7 @@ void PrintHelp() {
       << "  log mark <text>  Add a marker to the log\n"
       << "  hooks refresh    Re-apply file/debug hooks to newly loaded modules\n"
       << "  mods check  Find mod archives in folders that may still be scanned\n"
+      << "  console save [path]  Save this session log as a .txt file\n"
       << "  freecam   Toggle Relight freecam INI setting\n"
       << "  freecam on/off/status/path\n"
       << "  clear     Clear this console\n"
@@ -729,6 +758,31 @@ void CheckModFolders() {
     std::wcout << L"Found " << suspicious << L" archive/resource files in disabled/quarantine-looking folders.\n";
     std::wcout << L"If the game reads them, rename the inner 'archives' folder or move the folder outside the game root.\n";
   }
+}
+
+void SaveConsoleTranscript(const std::string& requestedPath) {
+  OpenLogFile();
+  {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    if (g_logFile) fflush(g_logFile);
+  }
+
+  fs::path outputPath;
+  if (requestedPath.empty()) {
+    outputPath = fs::current_path() / (L"ttds-console-" + FileTimestampText() + L".txt");
+  } else {
+    outputPath = Utf8ToWide(requestedPath);
+    if (outputPath.is_relative()) outputPath = fs::current_path() / outputPath;
+    if (outputPath.extension().empty()) outputPath += L".txt";
+  }
+
+  if (!CopyTextFile(g_logPath, outputPath)) {
+    std::wcout << L"Could not save console transcript to: " << outputPath << L"\n";
+    return;
+  }
+
+  std::wcout << L"Saved console transcript: " << outputPath << L"\n";
+  LogLine(L"console", L"saved transcript to " + outputPath.wstring());
 }
 
 void SetLogEnabled(bool enabled) {
@@ -835,6 +889,18 @@ DWORD WINAPI ConsoleThread(void*) {
         CheckModFolders();
       } else {
         std::cout << "Unknown mods command. Try: mods check\n";
+      }
+    } else if (verb == "console") {
+      const std::string sub = parts.size() > 1 ? ToLowerAscii(parts[1]) : "";
+      if (sub == "save") {
+        const size_t saveAt = command.find("save");
+        std::string requestedPath;
+        if (saveAt != std::string::npos) {
+          requestedPath = TrimAscii(command.substr(saveAt + 4));
+        }
+        SaveConsoleTranscript(requestedPath);
+      } else {
+        std::cout << "Unknown console command. Try: console save [path]\n";
       }
     } else if (verb == "freecam") {
       const std::string sub = parts.size() > 1 ? ToLowerAscii(parts[1]) : "";

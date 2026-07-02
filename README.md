@@ -85,6 +85,7 @@ bin\x64\Release\TTDSConsoleLauncher.exe --watch-only --game "C:\Program Files (x
 - `log debug on/off`: enable or disable `OutputDebugString` tracing
 - `hooks refresh`: re-apply hooks after new game DLLs/modules load
 - `mods check`: find mod archives inside disabled/quarantine-looking folders that may still be scanned
+- `console save [path]`: save the current console/log session as a `.txt` file
 - `freecam`: toggle Relight's `FreeCameraOnlyMode` setting
 - `freecam on/off/status/path`: set or inspect Relight's freecam setting
 - `clear`: clear the console
