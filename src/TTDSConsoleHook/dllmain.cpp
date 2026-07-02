@@ -83,6 +83,10 @@ std::wstring ToLower(std::wstring value) {
   return value;
 }
 
+std::wstring ToLowerCopy(const std::wstring& value) {
+  return ToLower(value);
+}
+
 std::string ToLowerAscii(std::string value) {
   for (char& ch : value) {
     ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
@@ -175,7 +179,31 @@ void LogLine(const std::wstring& category, const std::wstring& message) {
   const std::wstring line = L"[" + NowText() + L"] [" + category + L"] " + message;
   std::lock_guard<std::mutex> lock(g_logMutex);
   if (g_logConsoleEnabled) {
+    const HANDLE console = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO info{};
+    const bool hasConsoleInfo = console != INVALID_HANDLE_VALUE && GetConsoleScreenBufferInfo(console, &info);
+    const WORD originalColor = hasConsoleInfo ? info.wAttributes : static_cast<WORD>(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
+    const std::wstring lowerCategory = ToLowerCopy(category);
+    const std::wstring lowerMessage = ToLowerCopy(message);
+    WORD color = originalColor;
+    if (lowerMessage.find(L"fail") != std::wstring::npos || lowerCategory == L"error") {
+      color = FOREGROUND_RED | FOREGROUND_INTENSITY;
+    } else if (lowerCategory == L"save" || lowerCategory == L"write" || lowerMessage.find(L" save") != std::wstring::npos || lowerMessage.find(L"prefs") != std::wstring::npos) {
+      color = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY;
+    } else if (lowerCategory == L"camera") {
+      color = FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY;
+    } else if (lowerCategory == L"texture") {
+      color = FOREGROUND_RED | FOREGROUND_BLUE | FOREGROUND_INTENSITY;
+    } else if (lowerCategory == L"archive") {
+      color = FOREGROUND_GREEN | FOREGROUND_INTENSITY;
+    } else if (lowerCategory == L"mod" || lowerCategory == L"relight" || lowerCategory == L"freecam") {
+      color = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY;
+    } else if (lowerCategory == L"debug") {
+      color = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+    }
+    if (hasConsoleInfo) SetConsoleTextAttribute(console, color);
     fwprintf(stdout, L"\n%ls\n", line.c_str());
+    if (hasConsoleInfo) SetConsoleTextAttribute(console, originalColor);
     fflush(stdout);
   }
   if (g_logFile) {
@@ -521,6 +549,24 @@ bool IsArchivePath(const std::wstring& lower) {
          lower.find(L".ttarch") != std::wstring::npos;
 }
 
+bool IsOwnConsoleLogPath(const std::wstring& lower) {
+  const std::wstring name = ToLower(FileNameOnly(lower));
+  return name == L"ttds-dev-console.log" ||
+         name.find(L"ttds-console-") == 0;
+}
+
+std::wstring LogCategoryForPath(const std::wstring& path, const std::wstring& fallback) {
+  const std::wstring lower = ToLower(path);
+  if (IsSaveOrPrefsPath(lower)) return L"save";
+  if (IsCameraPathLower(lower)) return L"camera";
+  if (IsTexturePathLower(lower)) return L"texture";
+  if (IsRelightPath(lower)) return L"relight";
+  if (IsModPath(lower)) return L"mod";
+  if (IsArchivePath(lower)) return L"archive";
+  if (IsResourcePathLower(lower)) return L"resource";
+  return fallback;
+}
+
 bool IsBootArchiveScanNoise(const std::wstring& lower) {
   const std::wstring name = ToLower(FileNameOnly(lower));
   return name.find(L"_resdesc_50_") == 0 ||
@@ -537,12 +583,13 @@ bool IsBootArchiveScanNoise(const std::wstring& lower) {
 }
 
 bool ShouldLogFileEvent(const std::wstring& path, HANDLE result) {
-  if (!LooksInterestingPath(path)) return false;
+  const int focus = g_logFocusMode.load();
+  const std::wstring lower = ToLower(path);
+  if (IsOwnConsoleLogPath(lower)) return false;
+  if (focus != 0 && !LooksInterestingPath(path)) return false;
   if (g_logFailuresOnly && result != INVALID_HANDLE_VALUE) return false;
 
-  const std::wstring lower = ToLower(path);
   const bool failed = result == INVALID_HANDLE_VALUE;
-  const int focus = g_logFocusMode.load();
   const bool texture = IsTexturePathLower(lower);
   const bool camera = IsCameraPathLower(lower);
 
@@ -589,9 +636,11 @@ std::wstring FormatFileEvent(const std::wstring& apiName, DWORD desiredAccess, D
 }
 
 bool ShouldTrackHandle(const std::wstring& path, HANDLE result) {
+  const std::wstring lower = ToLower(path);
   return result != INVALID_HANDLE_VALUE &&
          result != nullptr &&
-         LooksInterestingPath(path);
+         !IsOwnConsoleLogPath(lower) &&
+         (g_logFocusMode.load() == 0 || LooksInterestingPath(path));
 }
 
 void RememberHandle(HANDLE handle, const std::wstring& path) {
@@ -615,14 +664,16 @@ std::wstring PathForHandle(HANDLE handle) {
 }
 
 bool ShouldLogWriteEvent(const std::wstring& path, BOOL ok) {
-  if (path.empty() || !LooksInterestingPath(path)) return false;
+  if (path.empty()) return false;
+  const int focus = g_logFocusMode.load();
+  const std::wstring lower = ToLower(path);
+  if (IsOwnConsoleLogPath(lower)) return false;
+  if (focus != 0 && !LooksInterestingPath(path)) return false;
   if (g_logFailuresOnly && ok) return false;
 
-  const std::wstring lower = ToLower(path);
   const bool failed = !ok;
   const bool texture = IsTexturePathLower(lower);
   const bool camera = IsCameraPathLower(lower);
-  const int focus = g_logFocusMode.load();
 
   if (texture && !g_textureTraceEnabled) return false;
   if (camera && !g_cameraTraceEnabled) return false;
@@ -758,7 +809,8 @@ void HandleReloadCommand(const std::string& sub) {
   std::wcout << L"Newest reload candidate:\n";
   PrintSaveCandidate(candidate, 1);
   std::wcout << L"Path: " << candidate.path << L"\n";
-  std::wcout << L"Live save loading is not attached yet; this command currently finds the safest candidate first.\n";
+  std::wcout << L"Live engine reload is not attached yet. This command only finds the safest save candidate for now.\n";
+  std::wcout << L"Use 'reload list' to inspect candidates; a true reload needs a Telltale engine/Lua reload function hook.\n";
   LogLine(L"reload", L"candidate " + candidate.kind + L" " + candidate.path.wstring());
 }
 
@@ -857,7 +909,7 @@ HANDLE WINAPI HookCreateFileW(
     if (!g_insideHook && g_logEnabled && g_fileTraceEnabled) {
       g_insideHook = true;
       if (ShouldLogFileEvent(path, result)) {
-        LogLine(L"file", FormatFileEvent(L"CreateFileW", desiredAccess, creationDisposition, result, path));
+        LogLine(LogCategoryForPath(path, L"file"), FormatFileEvent(L"CreateFileW", desiredAccess, creationDisposition, result, path));
       }
       g_insideHook = false;
     }
@@ -895,7 +947,7 @@ HANDLE WINAPI HookCreateFileA(
     if (!g_insideHook && g_logEnabled && g_fileTraceEnabled) {
       g_insideHook = true;
       if (ShouldLogFileEvent(path, result)) {
-        LogLine(L"file", FormatFileEvent(L"CreateFileA", desiredAccess, creationDisposition, result, path));
+        LogLine(LogCategoryForPath(path, L"file"), FormatFileEvent(L"CreateFileA", desiredAccess, creationDisposition, result, path));
       }
       g_insideHook = false;
     }
@@ -921,7 +973,7 @@ BOOL WINAPI HookWriteFile(
     if (ShouldLogWriteEvent(path, ok)) {
       const DWORD actualBytes = numberOfBytesWritten ? *numberOfBytesWritten : (ok ? numberOfBytesToWrite : 0);
       g_insideHook = true;
-      LogLine(L"write", FormatWriteEvent(ok, numberOfBytesToWrite, actualBytes, path));
+      LogLine(LogCategoryForPath(path, L"write"), FormatWriteEvent(ok, numberOfBytesToWrite, actualBytes, path));
       g_insideHook = false;
     }
   }
@@ -1024,7 +1076,7 @@ void PrintHelp() {
       << "  hooks refresh    Re-apply file/debug hooks to newly loaded modules\n"
       << "  mods check  Find mod archives in folders that may still be scanned\n"
       << "  console save [path]  Save this session log as a .txt file\n"
-      << "  reload    Find newest quicksave/autosave/checkpoint/save\n"
+      << "  reload    Find newest quicksave/autosave/checkpoint/save; live engine reload is not hooked yet\n"
       << "  reload list  List reload candidates\n"
       << "  freecam   Toggle Relight freecam INI setting\n"
       << "  freecam on/off/status/path\n"
@@ -1135,9 +1187,20 @@ void SaveConsoleTranscript(const std::string& requestedPath) {
 
 void SetLogEnabled(bool enabled) {
   OpenLogFile();
+  if (enabled) {
+    g_logConsoleEnabled = true;
+    g_logCompactEnabled = true;
+    g_fileTraceEnabled = true;
+    g_writeTraceEnabled = true;
+    g_debugStringTraceEnabled = true;
+    g_textureTraceEnabled = true;
+    g_cameraTraceEnabled = true;
+    g_logFailuresOnly = false;
+    g_logFocusMode = 0;
+  }
   g_logEnabled = enabled;
-  LogLine(L"console", enabled ? L"log on" : L"log off");
-  std::cout << (enabled ? "Log enabled. Live lines will print here too.\n" : "Log disabled.\n");
+  LogLine(L"console", enabled ? L"log on; verbose/all tracing enabled" : L"log off");
+  std::cout << (enabled ? "Log enabled. Default mode is now focus=all with file/write/debug/texture/camera tracing on.\n" : "Log disabled.\n");
   std::wcout << L"Path: " << g_logPath << L"\n";
 }
 
@@ -1174,7 +1237,7 @@ DWORD WINAPI ConsoleThread(void*) {
   const int patchedImports = InstallHooks();
 
   std::cout << "TTDS Dev Console injected.\n";
-  std::cout << "This is v1: console, command loop, file/debug logging, freecam state.\n";
+  std::cout << "This is v0.1.4: console, command loop, colored verbose logging, freecam state.\n";
   std::cout << "Hooked import entries: " << patchedImports << "\n";
   PrintHelp();
 

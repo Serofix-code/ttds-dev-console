@@ -15,6 +15,7 @@ This is an early proof-of-concept. It launches `WDC.exe`, watches the game's sta
 - can show failed file opens to help diagnose missing Relight files, mod conflicts, and other load issues
 - can save the console/log session to a `.txt` file
 - can find the newest quicksave/autosave/checkpoint/save candidate with `reload`
+- uses colored live console output for saves/writes, archives, textures, camera-ish resources, mods, Relight, debug, and failures
 - can toggle TTDS Relighting's freecam configuration when Relight is installed
 
 ## Modding / Archive Debugging
@@ -40,6 +41,8 @@ Write log lines show when the game actually writes bytes to a tracked file:
 ```
 
 Texture and camera logging is currently resource/file-level telemetry. It can show texture archives/resources and camera-ish scene/chore files being opened or written, but it does not yet read live engine camera position, FOV, or GPU material swaps directly.
+
+When you run `log on`, the console switches to its verbose default: focus `all`, file tracing on, write tracing on, texture/camera resource tracing on, debug-string tracing on, and failures-only mode off. You can narrow it afterward with commands like `log focus saves`, `log focus textures`, or `log failures on`.
 
 ## Safety Notes
 
@@ -110,7 +113,7 @@ bin\x64\Release\TTDSConsoleLauncher.exe --watch-only --game "C:\Program Files (x
 - `where`: show current directory
 - `archives`: count files in the `Archives` folder
 - `log`: show log status
-- `log on`: start writing `ttds-dev-console.log` in the game folder and print live hook lines in the console
+- `log on`: start writing `ttds-dev-console.log` in the game folder, enable verbose/all tracing, and print live colored hook lines in the console
 - `log off`: stop writing new log entries
 - `log console on/off`: show or hide live log lines in the console
 - `log format compact/full`: switch between readable short file logs and raw Windows file-open logs
@@ -136,7 +139,7 @@ bin\x64\Release\TTDSConsoleLauncher.exe --watch-only --game "C:\Program Files (x
 
 The current freecam command requires [TTDS Relighting](https://github.com/Telltale-Modding-Group/TTDS-Relighting) and edits `RelightMod\RelightConfiguration_Development.ini`. Relight reads that value when a scene initializes, so you still need to reload or load a scene before the camera changes apply. A true live toggle needs a runtime Lua bridge or direct camera backend hooks.
 
-The current `reload` command finds the safest reload candidate from the save folder, prioritizing quicksave, autosave, and checkpoint bundles before normal save-slot bundles. Live in-engine save loading is not attached yet, so it does not force the Telltale engine to load the bundle directly.
+The current `reload` command finds the safest reload candidate from the save folder, prioritizing quicksave, autosave, and checkpoint bundles before normal save-slot bundles. Live in-engine save loading is not attached yet, so it does not force the Telltale engine to load the bundle directly. A true reload command needs a Telltale engine/Lua reload function hook.
 
 ## License
 
