@@ -12,7 +12,20 @@ This is an early proof-of-concept. It launches `WDC.exe`, watches the game's sta
 - can check for installed mod archives and flag disabled/quarantine folders that the game may still scan
 - can show failed file opens to help diagnose missing Relight files, mod conflicts, and other load issues
 - can save the console/log session to a `.txt` file
-- can toggle TTDS Relighting's freecam configuration when Relight is installed
+- can toggle TTDS Relighting's freecam configuration when Relight is installed## Modding / Archive Debugging
+
+The console can help with TTDS modding because it shows readable file activity while the game is running. This includes `.ttarch2` archive reads, save writes, Relight files, and mod-related file access.
+
+For example, archive log lines like these show which game archives are being loaded:
+
+```txt
+[file] OK   READ  archive  archives\WDC_pc_WalkingDead101_data.ttarch2
+[file] OK   READ  archive  archives\WDC_pc_WalkingDead101_voice.ttarch2
+[file] OK   READ  archive  archives\WDC_pc_WalkingDead101_txmesh.ttarch2
+```
+
+This can be useful for checking whether the game is reading the expected episode archives, seeing when archives are loaded, and diagnosing mod load order or missing-file issues.
+
 
 ## Safety Notes
 
