@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <fstream>
 #include <filesystem>
 #include <iostream>
 #include <mutex>
@@ -15,12 +16,14 @@ namespace fs = std::filesystem;
 namespace {
 HMODULE g_module = nullptr;
 std::atomic_bool g_logEnabled{false};
+std::atomic_bool g_logConsoleEnabled{true};
 std::atomic_bool g_fileTraceEnabled{true};
 std::atomic_bool g_debugStringTraceEnabled{true};
 std::atomic_bool g_freecamEnabled{false};
 std::mutex g_logMutex;
 FILE* g_logFile = nullptr;
 fs::path g_logPath;
+fs::path g_relightDevelopmentConfigPath;
 
 using CreateFileWFn = HANDLE(WINAPI*)(
     LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
@@ -111,11 +114,152 @@ void CloseLogFile() {
 }
 
 void LogLine(const std::wstring& category, const std::wstring& message) {
-  if (!g_logFile) return;
+  const std::wstring line = L"[" + NowText() + L"] [" + category + L"] " + message;
   std::lock_guard<std::mutex> lock(g_logMutex);
-  if (!g_logFile) return;
-  fwprintf(g_logFile, L"[%ls] [%ls] %ls\n", NowText().c_str(), category.c_str(), message.c_str());
-  fflush(g_logFile);
+  if (g_logConsoleEnabled) {
+    fwprintf(stdout, L"\n%ls\n", line.c_str());
+    fflush(stdout);
+  }
+  if (g_logFile) {
+    fwprintf(g_logFile, L"%ls\n", line.c_str());
+    fflush(g_logFile);
+  }
+}
+
+fs::path RelightDevelopmentConfigPath() {
+  if (!g_relightDevelopmentConfigPath.empty()) return g_relightDevelopmentConfigPath;
+  g_relightDevelopmentConfigPath = fs::current_path() / L"RelightMod" / L"RelightConfiguration_Development.ini";
+  return g_relightDevelopmentConfigPath;
+}
+
+bool ReadTextFile(const fs::path& path, std::string* output) {
+  std::ifstream file(path, std::ios::binary);
+  if (!file) return false;
+  std::ostringstream buffer;
+  buffer << file.rdbuf();
+  *output = buffer.str();
+  return true;
+}
+
+bool WriteTextFile(const fs::path& path, const std::string& text) {
+  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  if (!file) return false;
+  file.write(text.data(), static_cast<std::streamsize>(text.size()));
+  return file.good();
+}
+
+std::string TrimAscii(const std::string& value) {
+  const char* whitespace = " \t\r\n";
+  const size_t start = value.find_first_not_of(whitespace);
+  if (start == std::string::npos) return "";
+  const size_t end = value.find_last_not_of(whitespace);
+  return value.substr(start, end - start + 1);
+}
+
+bool TryReadIniBool(const std::string& text, const std::string& section, const std::string& key, bool* value) {
+  std::istringstream stream(text);
+  std::string line;
+  bool inSection = false;
+  while (std::getline(stream, line)) {
+    std::string trimmed = TrimAscii(line);
+    if (trimmed.empty() || trimmed[0] == ';' || trimmed[0] == '#') continue;
+
+    if (trimmed.front() == '[' && trimmed.back() == ']') {
+      inSection = ToLowerAscii(trimmed.substr(1, trimmed.size() - 2)) == ToLowerAscii(section);
+      continue;
+    }
+
+    if (!inSection) continue;
+    const size_t equals = trimmed.find('=');
+    if (equals == std::string::npos) continue;
+    const std::string foundKey = TrimAscii(trimmed.substr(0, equals));
+    if (ToLowerAscii(foundKey) != ToLowerAscii(key)) continue;
+
+    const std::string foundValue = ToLowerAscii(TrimAscii(trimmed.substr(equals + 1)));
+    *value = foundValue == "true" || foundValue == "1" || foundValue == "yes" || foundValue == "on";
+    return true;
+  }
+  return false;
+}
+
+std::string SetIniKey(const std::string& text, const std::string& section, const std::string& key, const std::string& value) {
+  std::istringstream stream(text);
+  std::ostringstream output;
+  std::string line;
+  bool inSection = false;
+  bool sawSection = false;
+  bool wroteKey = false;
+
+  while (std::getline(stream, line)) {
+    const bool hadCarriageReturn = !line.empty() && line.back() == '\r';
+    if (hadCarriageReturn) line.pop_back();
+
+    const std::string trimmed = TrimAscii(line);
+    if (trimmed.size() >= 2 && trimmed.front() == '[' && trimmed.back() == ']') {
+      if (inSection && !wroteKey) {
+        output << key << "=" << value << "\r\n";
+        wroteKey = true;
+      }
+      inSection = ToLowerAscii(trimmed.substr(1, trimmed.size() - 2)) == ToLowerAscii(section);
+      if (inSection) sawSection = true;
+    } else if (inSection) {
+      const size_t equals = trimmed.find('=');
+      if (equals != std::string::npos) {
+        const std::string foundKey = TrimAscii(trimmed.substr(0, equals));
+        if (ToLowerAscii(foundKey) == ToLowerAscii(key)) {
+          output << key << "=" << value << "\r\n";
+          wroteKey = true;
+          continue;
+        }
+      }
+    }
+
+    output << line << "\r\n";
+  }
+
+  if (inSection && !wroteKey) {
+    output << key << "=" << value << "\r\n";
+    wroteKey = true;
+  }
+
+  if (!sawSection) {
+    output << "\r\n[" << section << "]\r\n";
+    output << key << "=" << value << "\r\n";
+  }
+
+  return output.str();
+}
+
+bool BackupFileOnce(const fs::path& path) {
+  const fs::path backup = path.wstring() + L".bak";
+  if (fs::exists(backup)) return true;
+  std::error_code error;
+  fs::copy_file(path, backup, fs::copy_options::none, error);
+  return !error;
+}
+
+bool GetRelightFreecamSetting(bool* enabled) {
+  std::string text;
+  if (!ReadTextFile(RelightDevelopmentConfigPath(), &text)) return false;
+  return TryReadIniBool(text, "DevelopmentTools", "FreeCameraOnlyMode", enabled);
+}
+
+bool SetRelightFreecamSetting(bool enabled, std::wstring* errorMessage) {
+  const fs::path path = RelightDevelopmentConfigPath();
+  std::string text;
+  if (!ReadTextFile(path, &text)) {
+    if (errorMessage) *errorMessage = L"Could not read " + path.wstring();
+    return false;
+  }
+
+  BackupFileOnce(path);
+  text = SetIniKey(text, "DevelopmentTools", "FreeCameraOnlyMode", enabled ? "true" : "false");
+  if (!WriteTextFile(path, text)) {
+    if (errorMessage) *errorMessage = L"Could not write " + path.wstring();
+    return false;
+  }
+
+  return true;
 }
 
 bool LooksInterestingPath(const std::wstring& path) {
@@ -357,11 +501,12 @@ void PrintHelp() {
       << "  log       Show log status\n"
       << "  log on    Start writing ttds-dev-console.log\n"
       << "  log off   Stop writing the log\n"
+      << "  log console on/off  Show or hide live log lines in this console\n"
       << "  log path  Print the log file path\n"
       << "  log mark <text>  Add a marker to the log\n"
       << "  hooks refresh    Re-apply file/debug hooks to newly loaded modules\n"
-      << "  freecam   Toggle freecam request state\n"
-      << "  freecam on/off/status\n"
+      << "  freecam   Toggle Relight freecam INI setting\n"
+      << "  freecam on/off/status/path\n"
       << "  clear     Clear this console\n"
       << "  detach    Unload the hook DLL and close this console\n";
 }
@@ -370,8 +515,12 @@ void PrintStatus() {
   std::wcout << L"Process ID: " << GetCurrentProcessId() << L"\n";
   std::wcout << L"Hook DLL:   " << GetModulePath(g_module) << L"\n";
   std::wcout << L"Log:        " << (g_logEnabled ? L"on" : L"off") << L"\n";
+  std::wcout << L"Live log:   " << (g_logConsoleEnabled ? L"console on" : L"console off") << L"\n";
   std::wcout << L"Log file:   " << g_logPath << L"\n";
-  std::wcout << L"Freecam:    " << (g_freecamEnabled ? L"requested/on" : L"off") << L"\n";
+  bool relightFreecam = false;
+  const bool hasRelightFreecam = GetRelightFreecamSetting(&relightFreecam);
+  std::wcout << L"Freecam:    " << (hasRelightFreecam ? (relightFreecam ? L"Relight INI on" : L"Relight INI off") : L"Relight INI unavailable") << L"\n";
+  std::wcout << L"Freecam cfg:" << RelightDevelopmentConfigPath() << L"\n";
 }
 
 void CountArchives() {
@@ -391,6 +540,7 @@ void CountArchives() {
 
 void PrintLogStatus() {
   std::wcout << L"Log:        " << (g_logEnabled ? L"on" : L"off") << L"\n";
+  std::wcout << L"Live log:   " << (g_logConsoleEnabled ? L"console on" : L"console off") << L"\n";
   std::wcout << L"File trace: " << (g_fileTraceEnabled ? L"on" : L"off") << L"\n";
   std::wcout << L"Debug trace:" << (g_debugStringTraceEnabled ? L" on" : L" off") << L"\n";
   std::wcout << L"Path:       " << g_logPath << L"\n";
@@ -400,19 +550,25 @@ void SetLogEnabled(bool enabled) {
   OpenLogFile();
   g_logEnabled = enabled;
   LogLine(L"console", enabled ? L"log on" : L"log off");
-  std::cout << (enabled ? "Log enabled.\n" : "Log disabled.\n");
+  std::cout << (enabled ? "Log enabled. Live lines will print here too.\n" : "Log disabled.\n");
   std::wcout << L"Path: " << g_logPath << L"\n";
 }
 
 void SetFreecam(bool enabled) {
   g_freecamEnabled = enabled;
-  LogLine(L"freecam", enabled
-      ? L"freecam requested on; camera backend not attached yet"
-      : L"freecam requested off");
-  std::cout << (enabled ? "Freecam request is ON.\n" : "Freecam request is OFF.\n");
-  if (enabled) {
-    std::cout << "Camera backend is not attached yet; this currently logs/toggles state only.\n";
+  std::wstring error;
+  if (!SetRelightFreecamSetting(enabled, &error)) {
+    std::wcout << L"Freecam request failed: " << error << L"\n";
+    LogLine(L"freecam", L"failed: " + error);
+    return;
   }
+
+  LogLine(L"freecam", enabled
+      ? L"Relight FreeCameraOnlyMode=true"
+      : L"Relight FreeCameraOnlyMode=false");
+  std::cout << (enabled ? "Relight FreeCameraOnlyMode is ON.\n" : "Relight FreeCameraOnlyMode is OFF.\n");
+  std::wcout << L"Config: " << RelightDevelopmentConfigPath() << L"\n";
+  std::cout << "Reload/load a scene for Relight to apply this.\n";
 }
 
 std::vector<std::string> SplitCommand(const std::string& command) {
@@ -463,6 +619,9 @@ DWORD WINAPI ConsoleThread(void*) {
         const std::string text = markAt == std::string::npos ? "" : command.substr(markAt + 4);
         LogLine(L"mark", Utf8ToWide(text));
         std::cout << "Marked.\n";
+      } else if (sub == "console") {
+        if (parts.size() > 2) g_logConsoleEnabled = ToLowerAscii(parts[2]) != "off";
+        PrintLogStatus();
       } else if (sub == "files") {
         if (parts.size() > 2) g_fileTraceEnabled = ToLowerAscii(parts[2]) != "off";
         PrintLogStatus();
@@ -483,9 +642,22 @@ DWORD WINAPI ConsoleThread(void*) {
       } else if (sub == "off") {
         SetFreecam(false);
       } else if (sub == "status") {
-        std::cout << "Freecam request is " << (g_freecamEnabled ? "ON" : "OFF") << ".\n";
+        bool relightFreecam = false;
+        if (GetRelightFreecamSetting(&relightFreecam)) {
+          std::cout << "Relight FreeCameraOnlyMode is " << (relightFreecam ? "ON" : "OFF") << ".\n";
+        } else {
+          std::cout << "Relight freecam config was not found/readable.\n";
+        }
+        std::wcout << L"Config: " << RelightDevelopmentConfigPath() << L"\n";
+      } else if (sub == "path") {
+        std::wcout << RelightDevelopmentConfigPath() << L"\n";
       } else {
-        SetFreecam(!g_freecamEnabled);
+        bool relightFreecam = false;
+        if (GetRelightFreecamSetting(&relightFreecam)) {
+          SetFreecam(!relightFreecam);
+        } else {
+          SetFreecam(!g_freecamEnabled);
+        }
       }
     } else if (verb == "clear") {
       system("cls");

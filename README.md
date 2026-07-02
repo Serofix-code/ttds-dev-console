@@ -43,19 +43,20 @@ If the console appears and then disappears during the loading screen, that usual
 - `where`: show current directory
 - `archives`: count files in the `Archives` folder
 - `log`: show log status
-- `log on`: start writing `ttds-dev-console.log` in the game folder
+- `log on`: start writing `ttds-dev-console.log` in the game folder and print live hook lines in the console
 - `log off`: stop writing new log entries
+- `log console on/off`: show or hide live log lines in the console
 - `log path`: print the log file path
 - `log mark <text>`: add a marker while testing a scene/menu/action
 - `log files on/off`: enable or disable file-open tracing
 - `log debug on/off`: enable or disable `OutputDebugString` tracing
 - `hooks refresh`: re-apply hooks after new game DLLs/modules load
-- `freecam`: toggle the freecam request flag
-- `freecam on/off/status`: set or inspect the freecam request flag
+- `freecam`: toggle Relight's `FreeCameraOnlyMode` setting
+- `freecam on/off/status/path`: set or inspect Relight's freecam setting
 - `clear`: clear the console
 - `detach`: unload the hook DLL and close the console
 
-The current freecam command is plumbing only: it toggles and logs the requested state, but the real Telltale camera backend still needs to be identified and wired.
+The current freecam command edits `RelightMod\RelightConfiguration_Development.ini`. Relight reads that value when a scene initializes, so you still need to reload or load a scene before the camera changes apply. A true live toggle needs a runtime Lua bridge or direct camera backend hooks.
 
 ## Roadmap
 
