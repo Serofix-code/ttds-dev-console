@@ -4,6 +4,16 @@ Experimental injected dev console for **The Walking Dead: The Telltale Definitiv
 
 This is an early proof-of-concept. It launches `WDC.exe`, watches the game's startup handoff, injects `TTDSConsoleHook.dll` into the active game process, and opens a visible console window inside the game.
 
+## Features
+
+- injects a visible console into the active `WDC.exe` game process
+- can auto-watch for Steam-launched game sessions
+- logs readable file activity for saves, archives, Relight, and mods
+- can check for installed mod archives and flag disabled/quarantine folders that the game may still scan
+- can show failed file opens to help diagnose missing Relight files, mod conflicts, and other load issues
+- can save the console/log session to a `.txt` file
+- can toggle TTDS Relighting's freecam configuration when Relight is installed
+
 ## Safety Notes
 
 - This is for local single-player modding/testing only.
@@ -92,6 +102,10 @@ bin\x64\Release\TTDSConsoleLauncher.exe --watch-only --game "C:\Program Files (x
 - `detach`: unload the hook DLL and close the console
 
 The current freecam command requires [TTDS Relighting](https://github.com/Telltale-Modding-Group/TTDS-Relighting) and edits `RelightMod\RelightConfiguration_Development.ini`. Relight reads that value when a scene initializes, so you still need to reload or load a scene before the camera changes apply. A true live toggle needs a runtime Lua bridge or direct camera backend hooks.
+
+## License
+
+This project uses the **Serofix Non-Commercial Source License 1.0**. You can read, study, copy, modify, and publish meaningfully different modified versions, but you cannot sell this software or modified versions of it without prior written permission. See [LICENSE](LICENSE).
 
 ## Roadmap
 
