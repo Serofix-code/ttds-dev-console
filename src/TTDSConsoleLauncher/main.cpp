@@ -1,7 +1,6 @@
 #include <windows.h>
 #include <tlhelp32.h>
 
-#include <algorithm>
 #include <filesystem>
 #include <iostream>
 #include <map>
@@ -35,18 +34,6 @@ bool HasFlag(const std::vector<std::wstring>& args, const std::wstring& name) {
     if (arg == name) return true;
   }
   return false;
-}
-
-std::wstring ToLower(std::wstring value) {
-  std::transform(value.begin(), value.end(), value.begin(), [](wchar_t c) {
-    return static_cast<wchar_t>(towlower(c));
-  });
-  return value;
-}
-
-bool IsWdcImage(const std::wstring& path) {
-  if (path.empty()) return false;
-  return ToLower(fs::path(path).filename().wstring()) == L"wdc.exe";
 }
 
 bool IsProcessRunning(const std::wstring& exeName) {
@@ -160,7 +147,6 @@ bool InjectDll(HANDLE process, DWORD processId, const fs::path& dllPath) {
   if (!thread) {
     std::wcerr << L"CreateRemoteThread failed: " << GetLastErrorText(GetLastError()) << L"\n";
     VirtualFreeEx(process, remotePath, 0, MEM_RELEASE);
-    CloseHandle(process);
     return false;
   }
 
@@ -210,19 +196,6 @@ bool InjectDllAsync(HANDLE process, DWORD processId, const fs::path& dllPath) {
 
   CloseHandle(thread);
   return true;
-}
-
-std::wstring GetPathFromFileHandle(HANDLE file) {
-  if (!file || file == INVALID_HANDLE_VALUE) return L"";
-  wchar_t path[MAX_PATH * 4]{};
-  DWORD size = GetFinalPathNameByHandleW(file, path, static_cast<DWORD>(std::size(path)), FILE_NAME_NORMALIZED);
-  if (size == 0 || size >= std::size(path)) return L"";
-  std::wstring result(path);
-  constexpr const wchar_t* devicePrefix = L"\\\\?\\";
-  if (result.rfind(devicePrefix, 0) == 0) {
-    result.erase(0, 4);
-  }
-  return result;
 }
 
 struct DebugProcessInfo {
@@ -321,22 +294,20 @@ void TryPendingInjections(std::map<DWORD, DebugProcessInfo>& processes, const fs
   }
 }
 
-int DebugLaunchAndInject(const fs::path& exePath, const fs::path& gameDir, const fs::path& dllPath) {
+int LaunchAndWatch(const fs::path& exePath, const fs::path& gameDir, const fs::path& dllPath) {
   std::wstring commandLine = L"\"" + exePath.wstring() + L"\"";
   STARTUPINFOW startup{};
   startup.cb = sizeof(startup);
   PROCESS_INFORMATION processInfo{};
 
-  DebugSetProcessKillOnExit(FALSE);
-
-  std::wcout << L"Launching under relaunch watcher: " << exePath << L"\n";
+  std::wcout << L"Launching suspended: " << exePath << L"\n";
   BOOL created = CreateProcessW(
       exePath.c_str(),
       commandLine.data(),
       nullptr,
       nullptr,
       FALSE,
-      DEBUG_PROCESS,
+      CREATE_SUSPENDED,
       nullptr,
       gameDir.c_str(),
       &startup,
@@ -347,66 +318,25 @@ int DebugLaunchAndInject(const fs::path& exePath, const fs::path& gameDir, const
     return 1;
   }
 
+  std::wcout << L"WDC.exe PID: " << processInfo.dwProcessId << L"\n";
+  std::wcout << L"Injecting first process: " << dllPath << L"\n";
+  const bool initialInjected = InjectDll(processInfo.hProcess, processInfo.dwProcessId, dllPath);
+  if (!initialInjected) {
+    std::wcerr << L"Initial injection failed. Resuming game and watching for a relaunch target.\n";
+  }
+
+  ResumeThread(processInfo.hThread);
   CloseHandle(processInfo.hThread);
-  CloseHandle(processInfo.hProcess);
 
   std::map<DWORD, DebugProcessInfo> processes;
-  while (true) {
-    DEBUG_EVENT event{};
-    if (!WaitForDebugEvent(&event, 250)) {
-      const DWORD error = GetLastError();
-      if (error != ERROR_SEM_TIMEOUT) {
-        std::wcerr << L"Debug loop ended: " << GetLastErrorText(error) << L"\n";
-        break;
-      }
-      TryPendingInjections(processes, dllPath);
-      continue;
-    }
+  processes[processInfo.dwProcessId] = DebugProcessInfo{
+      processInfo.hProcess,
+      initialInjected ? 0 : GetTickCount64() + 1000,
+      initialInjected,
+      exePath.wstring()};
 
-    DWORD continueStatus = DBG_CONTINUE;
-    if (event.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT) {
-      const auto& info = event.u.CreateProcessInfo;
-      std::wstring imagePath = GetPathFromFileHandle(info.hFile);
-      if (info.hFile) CloseHandle(info.hFile);
-      if (info.hThread) CloseHandle(info.hThread);
-
-      if (IsWdcImage(imagePath)) {
-        std::wcout << L"Detected WDC.exe PID " << event.dwProcessId;
-        if (!imagePath.empty()) std::wcout << L" (" << imagePath << L")";
-        std::wcout << L"\n";
-        processes[event.dwProcessId] = DebugProcessInfo{
-            info.hProcess,
-            GetTickCount64() + 250,
-            false,
-            imagePath};
-      } else if (info.hProcess) {
-        CloseHandle(info.hProcess);
-      }
-    } else if (event.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT) {
-      auto found = processes.find(event.dwProcessId);
-      if (found != processes.end()) {
-        std::wcout << L"WDC.exe PID " << event.dwProcessId << L" exited.\n";
-        if (found->second.process) CloseHandle(found->second.process);
-        processes.erase(found);
-      }
-    } else if (event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
-      const DWORD code = event.u.Exception.ExceptionRecord.ExceptionCode;
-      if (code != EXCEPTION_BREAKPOINT && code != DBG_PRINTEXCEPTION_C && code != DBG_PRINTEXCEPTION_WIDE_C) {
-        continueStatus = DBG_EXCEPTION_NOT_HANDLED;
-      }
-    }
-
-    ContinueDebugEvent(event.dwProcessId, event.dwThreadId, continueStatus);
-    TryPendingInjections(processes, dllPath);
-  }
-
-  for (auto& [pid, info] : processes) {
-    if (info.process) CloseHandle(info.process);
-  }
-
-  std::wcout << L"Watching for WDC.exe relaunches for 60 seconds...\n";
-  processes.clear();
-  const ULONGLONG watchUntil = GetTickCount64() + 60000;
+  std::wcout << L"Watching for WDC.exe relaunches. Keep this launcher open while the game runs.\n";
+  const ULONGLONG watchUntil = GetTickCount64() + 120000;
   while (GetTickCount64() < watchUntil || HasTrackedProcess(processes)) {
     TryPendingInjections(processes, dllPath);
     Sleep(250);
@@ -445,5 +375,5 @@ int wmain(int argc, wchar_t** argv) {
     return 1;
   }
 
-  return DebugLaunchAndInject(exePath, gameDir, dllPath);
+  return LaunchAndWatch(exePath, gameDir, dllPath);
 }

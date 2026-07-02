@@ -32,7 +32,7 @@ bin\x64\Release\TTDSConsoleHook.dll
 bin\x64\Release\TTDSConsoleLauncher.exe --game "C:\Program Files (x86)\Steam\steamapps\common\The Walking Dead The Telltale Definitive Series"
 ```
 
-The launcher starts `WDC.exe` under a relaunch watcher. Keep the launcher window open while the game starts; the first `WDC.exe` can hand off to another `WDC.exe`, and the watcher will inject again when that happens.
+The launcher starts `WDC.exe`, injects the first process, and then watches for relaunches. Keep the launcher window open while the game starts; the first `WDC.exe` can hand off to another `WDC.exe`, and the watcher will inject again when that happens.
 
 If the console appears and then disappears during the loading screen, that usually means the first bootstrap process exited. Leave the launcher running and wait for the final game process to be detected.
 
