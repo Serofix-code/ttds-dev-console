@@ -13,6 +13,8 @@ This is an early proof-of-concept. It launches `WDC.exe`, watches the game's sta
 - can show failed file opens to help diagnose missing Relight files, mod conflicts, and other load issues
 - can save the console/log session to a `.txt` file
 - can toggle TTDS Relighting's freecam configuration when Relight is installed## Modding / Archive Debugging
+- helps with modding/debugging by showing which `.ttarch2` archives the game actually reads during startup and gameplay, making it easier to see what loads, in what order, and whether a mod/archive is being detected
+
 
 The console can help with TTDS modding because it shows readable file activity while the game is running. This includes `.ttarch2` archive reads, save writes, Relight files, and mod-related file access.
 
