@@ -3,9 +3,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <sstream>
@@ -34,6 +39,16 @@ FILE* g_logFile = nullptr;
 fs::path g_logPath;
 fs::path g_relightDevelopmentConfigPath;
 std::unordered_map<HANDLE, std::wstring> g_trackedHandles;
+std::mutex g_cameraHookMutex;
+alignas(8) volatile uintptr_t g_cameraAddressRaw = 0;
+std::atomic_bool g_cameraPointerHookInstalled{false};
+std::atomic_bool g_cameraLiveLogEnabled{false};
+std::atomic_bool g_cameraMonitorRunning{false};
+std::atomic_int g_cameraLogIntervalMs{500};
+HANDLE g_cameraMonitorThread = nullptr;
+unsigned char* g_cameraHookTarget = nullptr;
+void* g_cameraHookStub = nullptr;
+unsigned char g_cameraHookOriginal[7]{};
 
 using CreateFileWFn = HANDLE(WINAPI*)(
     LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
@@ -864,6 +879,365 @@ void HandleReloadCommand(const std::string& sub) {
   LogLine(L"reload", L"candidate " + candidate.kind + L" " + candidate.path.wstring());
 }
 
+struct CameraState {
+  uintptr_t base = 0;
+  float x = 0.0f;
+  float y = 0.0f;
+  float z = 0.0f;
+  float pitch = 0.0f;
+  float yaw = 0.0f;
+  float roll = 0.0f;
+  float fov = 0.0f;
+};
+
+float ClampFloat(float value, float minimum, float maximum) {
+  return std::max(minimum, std::min(maximum, value));
+}
+
+float RadiansToDegrees(float radians) {
+  return radians * 57.29577951308232f;
+}
+
+bool SafeReadFloat(uintptr_t address, float* value) {
+  __try {
+    *value = *reinterpret_cast<volatile float*>(address);
+    return std::isfinite(*value);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+
+bool IsReadableAddress(uintptr_t address, size_t bytes) {
+  MEMORY_BASIC_INFORMATION info{};
+  if (!VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info))) return false;
+  if (info.State != MEM_COMMIT) return false;
+  if (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+  const uintptr_t regionStart = reinterpret_cast<uintptr_t>(info.BaseAddress);
+  const uintptr_t regionEnd = regionStart + info.RegionSize;
+  return address >= regionStart && address + bytes <= regionEnd;
+}
+
+bool ReadCameraState(CameraState* state) {
+  const uintptr_t base = g_cameraAddressRaw;
+  if (base < 0x10000 || !IsReadableAddress(base, 0x1CC)) return false;
+
+  CameraState next;
+  next.base = base;
+  if (!SafeReadFloat(base + 0x138, &next.x)) return false;
+  if (!SafeReadFloat(base + 0x130, &next.y)) return false;
+  if (!SafeReadFloat(base + 0x134, &next.z)) return false;
+  if (!SafeReadFloat(base + 0x1C8, &next.fov)) return false;
+
+  float rot2 = 0.0f;
+  float rot5 = 0.0f;
+  float rot7 = 0.0f;
+  float rot8 = 0.0f;
+  float rot9 = 0.0f;
+  if (SafeReadFloat(base + 0x104, &rot2) &&
+      SafeReadFloat(base + 0x114, &rot5) &&
+      SafeReadFloat(base + 0x120, &rot7) &&
+      SafeReadFloat(base + 0x124, &rot8) &&
+      SafeReadFloat(base + 0x128, &rot9)) {
+    const float pitch = std::asin(ClampFloat(rot8, -1.0f, 1.0f));
+    const float cp = std::cos(pitch);
+    float yaw = 0.0f;
+    float roll = 0.0f;
+    if (std::fabs(cp) > 0.0001f) {
+      yaw = std::acos(ClampFloat(rot9 / cp, -1.0f, 1.0f));
+      if (rot7 < 0.0f) yaw = -yaw;
+      roll = std::acos(ClampFloat(rot5 / cp, -1.0f, 1.0f));
+      if (rot2 < 0.0f) roll = -roll;
+    }
+    next.pitch = RadiansToDegrees(pitch);
+    next.yaw = RadiansToDegrees(yaw);
+    next.roll = RadiansToDegrees(roll);
+  }
+
+  *state = next;
+  return true;
+}
+
+bool CameraStateChanged(const CameraState& left, const CameraState& right) {
+  return left.base != right.base ||
+         std::fabs(left.x - right.x) > 0.01f ||
+         std::fabs(left.y - right.y) > 0.01f ||
+         std::fabs(left.z - right.z) > 0.01f ||
+         std::fabs(left.pitch - right.pitch) > 0.05f ||
+         std::fabs(left.yaw - right.yaw) > 0.05f ||
+         std::fabs(left.roll - right.roll) > 0.05f ||
+         std::fabs(left.fov - right.fov) > 0.05f;
+}
+
+std::wstring FormatCameraState(const CameraState& state) {
+  std::wstringstream text;
+  text << std::fixed << std::setprecision(3)
+       << L"POV ptr=0x" << std::hex << state.base << std::dec
+       << L" pos=(" << state.x << L", " << state.y << L", " << state.z << L")"
+       << L" rot=(" << state.pitch << L", " << state.yaw << L", " << state.roll << L")"
+       << L" fov=" << state.fov;
+  return text.str();
+}
+
+unsigned char* FindPatternInMainModule(const unsigned char* pattern, size_t patternSize) {
+  auto* base = reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
+  if (!base) return nullptr;
+  auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+  if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+  auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+  if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+
+  const size_t imageSize = nt->OptionalHeader.SizeOfImage;
+  if (imageSize < patternSize) return nullptr;
+  for (size_t i = 0; i <= imageSize - patternSize; ++i) {
+    if (memcmp(base + i, pattern, patternSize) == 0) return base + i;
+  }
+  return nullptr;
+}
+
+bool IsRel32Reachable(uintptr_t fromInstruction, uintptr_t target) {
+  const int64_t delta = static_cast<int64_t>(target) - static_cast<int64_t>(fromInstruction + 5);
+  return delta >= INT32_MIN && delta <= INT32_MAX;
+}
+
+void AppendU64(std::vector<unsigned char>* bytes, uint64_t value) {
+  for (int i = 0; i < 8; ++i) {
+    bytes->push_back(static_cast<unsigned char>((value >> (i * 8)) & 0xFF));
+  }
+}
+
+void AppendRel32Jump(std::vector<unsigned char>* bytes, uintptr_t instructionAddress, uintptr_t targetAddress) {
+  const int64_t delta = static_cast<int64_t>(targetAddress) - static_cast<int64_t>(instructionAddress + 5);
+  const int32_t relative = static_cast<int32_t>(delta);
+  bytes->push_back(0xE9);
+  for (int i = 0; i < 4; ++i) {
+    bytes->push_back(static_cast<unsigned char>((static_cast<uint32_t>(relative) >> (i * 8)) & 0xFF));
+  }
+}
+
+void* AllocateNear(uintptr_t target, size_t size) {
+  SYSTEM_INFO info{};
+  GetSystemInfo(&info);
+  const uintptr_t granularity = info.dwAllocationGranularity ? info.dwAllocationGranularity : 0x10000;
+  const uintptr_t alignedTarget = target & ~(granularity - 1);
+  const uintptr_t maxDistance = 0x70000000ULL;
+
+  for (uintptr_t delta = 0; delta < maxDistance; delta += granularity) {
+    const uintptr_t candidates[] = {
+        alignedTarget + delta,
+        alignedTarget > delta ? alignedTarget - delta : 0};
+    for (uintptr_t candidate : candidates) {
+      if (!candidate) continue;
+      if (!IsRel32Reachable(target, candidate)) continue;
+      void* memory = VirtualAlloc(reinterpret_cast<void*>(candidate), size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+      if (memory) return memory;
+    }
+  }
+  return nullptr;
+}
+
+bool InstallCameraPointerHook(std::wstring* message) {
+  std::lock_guard<std::mutex> lock(g_cameraHookMutex);
+  if (g_cameraPointerHookInstalled) {
+    if (message) *message = L"camera pointer hook already installed";
+    return true;
+  }
+
+  const unsigned char pattern[] = {0x80, 0xB9, 0xC3, 0x01, 0x00, 0x00, 0x00, 0x48, 0x8B, 0xD9};
+  unsigned char* target = FindPatternInMainModule(pattern, sizeof(pattern));
+  if (!target) {
+    if (message) *message = L"camera AOB was not found in WDC.exe";
+    return false;
+  }
+
+  void* stub = AllocateNear(reinterpret_cast<uintptr_t>(target), 128);
+  if (!stub) {
+    if (message) *message = L"could not allocate nearby camera hook stub";
+    return false;
+  }
+
+  memcpy(g_cameraHookOriginal, target, sizeof(g_cameraHookOriginal));
+
+  std::vector<unsigned char> stubBytes;
+  stubBytes.reserve(64);
+  stubBytes.push_back(0x50);  // push rax
+  stubBytes.push_back(0x48);  // mov rax, &g_cameraAddressRaw
+  stubBytes.push_back(0xB8);
+  AppendU64(&stubBytes, reinterpret_cast<uint64_t>(&g_cameraAddressRaw));
+  stubBytes.push_back(0x48);  // mov [rax], rcx
+  stubBytes.push_back(0x89);
+  stubBytes.push_back(0x08);
+  stubBytes.push_back(0x58);  // pop rax
+  for (size_t i = 0; i < sizeof(g_cameraHookOriginal); ++i) {
+    stubBytes.push_back(g_cameraHookOriginal[i]);
+  }
+  AppendRel32Jump(
+      &stubBytes,
+      reinterpret_cast<uintptr_t>(stub) + stubBytes.size(),
+      reinterpret_cast<uintptr_t>(target) + sizeof(g_cameraHookOriginal));
+
+  memcpy(stub, stubBytes.data(), stubBytes.size());
+
+  DWORD oldProtect = 0;
+  if (!VirtualProtect(target, sizeof(g_cameraHookOriginal), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+    VirtualFree(stub, 0, MEM_RELEASE);
+    if (message) *message = L"could not change camera hook page protection";
+    return false;
+  }
+
+  std::vector<unsigned char> patch;
+  AppendRel32Jump(&patch, reinterpret_cast<uintptr_t>(target), reinterpret_cast<uintptr_t>(stub));
+  patch.push_back(0x90);
+  patch.push_back(0x90);
+  memcpy(target, patch.data(), patch.size());
+  DWORD ignored = 0;
+  VirtualProtect(target, sizeof(g_cameraHookOriginal), oldProtect, &ignored);
+  FlushInstructionCache(GetCurrentProcess(), target, sizeof(g_cameraHookOriginal));
+
+  g_cameraHookTarget = target;
+  g_cameraHookStub = stub;
+  g_cameraPointerHookInstalled = true;
+  if (message) {
+    std::wstringstream status;
+    status << L"camera pointer hook installed at 0x" << std::hex << reinterpret_cast<uintptr_t>(target);
+    *message = status.str();
+  }
+  return true;
+}
+
+void UninstallCameraPointerHook() {
+  std::lock_guard<std::mutex> lock(g_cameraHookMutex);
+  if (!g_cameraPointerHookInstalled || !g_cameraHookTarget) return;
+
+  DWORD oldProtect = 0;
+  if (VirtualProtect(g_cameraHookTarget, sizeof(g_cameraHookOriginal), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+    memcpy(g_cameraHookTarget, g_cameraHookOriginal, sizeof(g_cameraHookOriginal));
+    DWORD ignored = 0;
+    VirtualProtect(g_cameraHookTarget, sizeof(g_cameraHookOriginal), oldProtect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), g_cameraHookTarget, sizeof(g_cameraHookOriginal));
+  }
+  if (g_cameraHookStub) {
+    VirtualFree(g_cameraHookStub, 0, MEM_RELEASE);
+  }
+  g_cameraAddressRaw = 0;
+  g_cameraHookTarget = nullptr;
+  g_cameraHookStub = nullptr;
+  g_cameraPointerHookInstalled = false;
+}
+
+DWORD WINAPI CameraMonitorThread(void*) {
+  CameraState last;
+  bool hasLast = false;
+  bool waitingLogged = false;
+  while (g_cameraMonitorRunning) {
+    if (g_cameraLiveLogEnabled && g_logEnabled) {
+      CameraState current;
+      if (ReadCameraState(&current)) {
+        waitingLogged = false;
+        if (!hasLast || CameraStateChanged(last, current)) {
+          LogLine(L"camera", FormatCameraState(current));
+          last = current;
+          hasLast = true;
+        }
+      } else if (!waitingLogged) {
+        LogLine(L"camera", L"waiting for active camera pointer");
+        waitingLogged = true;
+        hasLast = false;
+      }
+    }
+    Sleep(static_cast<DWORD>(std::max(100, g_cameraLogIntervalMs.load())));
+  }
+  return 0;
+}
+
+void StartCameraMonitorThread() {
+  if (g_cameraMonitorRunning) return;
+  g_cameraMonitorRunning = true;
+  g_cameraMonitorThread = CreateThread(nullptr, 0, CameraMonitorThread, nullptr, 0, nullptr);
+  if (!g_cameraMonitorThread) {
+    g_cameraMonitorRunning = false;
+  }
+}
+
+void StopCameraMonitorThread() {
+  if (!g_cameraMonitorRunning) return;
+  g_cameraMonitorRunning = false;
+  if (g_cameraMonitorThread) {
+    WaitForSingleObject(g_cameraMonitorThread, 1000);
+    CloseHandle(g_cameraMonitorThread);
+    g_cameraMonitorThread = nullptr;
+  }
+}
+
+void PrintCameraStatus() {
+  std::wcout << L"Camera hook: " << (g_cameraPointerHookInstalled ? L"installed" : L"not installed") << L"\n";
+  std::wcout << L"POV log:     " << (g_cameraLiveLogEnabled ? L"on" : L"off") << L"\n";
+  std::wcout << L"Interval:    " << g_cameraLogIntervalMs.load() << L" ms\n";
+  CameraState state;
+  if (ReadCameraState(&state)) {
+    std::wcout << FormatCameraState(state) << L"\n";
+  } else {
+    std::wcout << L"Camera pointer is not available yet. Load a scene or move the camera, then try again.\n";
+  }
+}
+
+void HandleCameraCommand(const std::vector<std::string>& parts) {
+  const std::string sub = parts.size() > 1 ? ToLowerAscii(parts[1]) : "status";
+  if (sub == "help") {
+    std::cout
+        << "Camera/POV commands:\n"
+        << "  camera hook           Install the read-only CE-style camera pointer hook\n"
+        << "  camera status         Print live camera pointer, position, rotation, and FOV\n"
+        << "  camera log on [ms]    Log live POV changes; default interval is 500 ms\n"
+        << "  camera log off        Stop live POV logging\n"
+        << "  camera interval <ms>  Set POV logging interval\n"
+        << "  pov ...               Alias for camera ...\n";
+    return;
+  }
+
+  if (sub == "hook") {
+    std::wstring message;
+    const bool ok = InstallCameraPointerHook(&message);
+    std::wcout << message << L"\n";
+    LogLine(ok ? L"camera" : L"error", message);
+    return;
+  }
+
+  if (sub == "log" || sub == "on" || sub == "off") {
+    const std::string state = sub == "log"
+        ? (parts.size() > 2 ? ToLowerAscii(parts[2]) : "status")
+        : sub;
+    if (state == "on") {
+      if (parts.size() > 3) {
+        g_cameraLogIntervalMs = std::max(100, atoi(parts[3].c_str()));
+      }
+      std::wstring message;
+      const bool ok = InstallCameraPointerHook(&message);
+      StartCameraMonitorThread();
+      g_cameraLiveLogEnabled = ok;
+      std::wcout << message << L"\n";
+      std::cout << (ok ? "POV logging is ON.\n" : "POV logging could not start.\n");
+      LogLine(ok ? L"camera" : L"error", ok ? L"POV logging on" : message);
+      return;
+    }
+    if (state == "off") {
+      g_cameraLiveLogEnabled = false;
+      std::cout << "POV logging is OFF.\n";
+      LogLine(L"camera", L"POV logging off");
+      return;
+    }
+  }
+
+  if (sub == "interval") {
+    if (parts.size() > 2) {
+      g_cameraLogIntervalMs = std::max(100, atoi(parts[2].c_str()));
+    }
+    std::wcout << L"POV logging interval: " << g_cameraLogIntervalMs.load() << L" ms\n";
+    return;
+  }
+
+  PrintCameraStatus();
+}
+
 std::vector<HMODULE> GetProcessModules() {
   std::vector<HMODULE> modules;
   HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
@@ -1131,6 +1505,8 @@ void PrintHelp() {
       << "  console save [path]  Save this session log as a .txt file\n"
       << "  reload    Find newest quicksave/autosave/checkpoint/save; live engine reload is not hooked yet\n"
       << "  reload list  List reload candidates\n"
+      << "  camera hook/status/log on/log off/interval <ms>\n"
+      << "  pov ...  Alias for camera ...\n"
       << "  freecam   Toggle Relight freecam INI setting\n"
       << "  freecam on/off/status/path\n"
       << "  clear     Clear this console\n"
@@ -1150,8 +1526,14 @@ void PrintStatus() {
   std::wcout << L"Write trace:" << (g_writeTraceEnabled ? L" on" : L" off") << L"\n";
   std::wcout << L"Textures:   " << (g_textureTraceEnabled ? L"on" : L"off") << L"\n";
   std::wcout << L"Cameras:    " << (g_cameraTraceEnabled ? L"on" : L"off") << L"\n";
+  std::wcout << L"POV hook:   " << (g_cameraPointerHookInstalled ? L"installed" : L"not installed") << L"\n";
+  std::wcout << L"POV log:    " << (g_cameraLiveLogEnabled ? L"on" : L"off") << L"\n";
   std::wcout << L"Debug trace:" << (g_debugStringTraceEnabled ? L" on" : L" off") << L"\n";
   std::wcout << L"Log file:   " << g_logPath << L"\n";
+  CameraState state;
+  if (ReadCameraState(&state)) {
+    std::wcout << FormatCameraState(state) << L"\n";
+  }
   bool relightFreecam = false;
   const bool hasRelightFreecam = GetRelightFreecamSetting(&relightFreecam);
   std::wcout << L"Freecam:    " << (hasRelightFreecam ? (relightFreecam ? L"Relight INI on" : L"Relight INI off") : L"Relight INI unavailable") << L"\n";
@@ -1183,6 +1565,8 @@ void PrintLogStatus() {
   std::wcout << L"Write trace:" << (g_writeTraceEnabled ? L" on" : L" off") << L"\n";
   std::wcout << L"Textures:   " << (g_textureTraceEnabled ? L"on" : L"off") << L"\n";
   std::wcout << L"Cameras:    " << (g_cameraTraceEnabled ? L"on" : L"off") << L"\n";
+  std::wcout << L"POV hook:   " << (g_cameraPointerHookInstalled ? L"installed" : L"not installed") << L"\n";
+  std::wcout << L"POV log:    " << (g_cameraLiveLogEnabled ? L"on" : L"off") << L"\n";
   std::wcout << L"Debug trace:" << (g_debugStringTraceEnabled ? L" on" : L" off") << L"\n";
   std::wcout << L"Path:       " << g_logPath << L"\n";
 }
@@ -1251,10 +1635,19 @@ void SetLogEnabled(bool enabled) {
     g_cameraTraceEnabled = true;
     g_logFailuresOnly = false;
     g_logFocusMode = 0;
+    std::wstring cameraMessage;
+    const bool cameraOk = InstallCameraPointerHook(&cameraMessage);
+    if (cameraOk) {
+      StartCameraMonitorThread();
+      g_cameraLiveLogEnabled = true;
+    }
+    LogLine(cameraOk ? L"camera" : L"error", cameraMessage);
+  } else {
+    g_cameraLiveLogEnabled = false;
   }
   g_logEnabled = enabled;
-  LogLine(L"console", enabled ? L"log on; verbose/all tracing enabled" : L"log off");
-  std::cout << (enabled ? "Log enabled. Default mode is now focus=all with file/write/debug/texture/camera tracing on.\n" : "Log disabled.\n");
+  LogLine(L"console", enabled ? L"log on; verbose/all tracing and POV logging enabled" : L"log off");
+  std::cout << (enabled ? "Log enabled. Default mode is now focus=all with file/write/debug/texture/camera/POV tracing on.\n" : "Log disabled.\n");
   std::wcout << L"Path: " << g_logPath << L"\n";
 }
 
@@ -1291,7 +1684,7 @@ DWORD WINAPI ConsoleThread(void*) {
   const int patchedImports = InstallHooks();
 
   std::cout << "TTDS Dev Console injected.\n";
-  std::cout << "This is v0.1.5: console, command loop, colored verbose logging, freecam state.\n";
+  std::cout << "This is v0.1.6: console, command loop, colored verbose logging, live POV logging, freecam state.\n";
   std::cout << "Hooked import entries: " << patchedImports << "\n";
   PrintHelp();
 
@@ -1388,6 +1781,8 @@ DWORD WINAPI ConsoleThread(void*) {
     } else if (verb == "reload") {
       const std::string sub = parts.size() > 1 ? ToLowerAscii(parts[1]) : "";
       HandleReloadCommand(sub);
+    } else if (verb == "camera" || verb == "pov") {
+      HandleCameraCommand(parts);
     } else if (verb == "freecam") {
       const std::string sub = parts.size() > 1 ? ToLowerAscii(parts[1]) : "";
       if (sub == "on") {
@@ -1423,6 +1818,9 @@ DWORD WINAPI ConsoleThread(void*) {
     }
   }
 
+  g_cameraLiveLogEnabled = false;
+  StopCameraMonitorThread();
+  UninstallCameraPointerHook();
   CloseLogFile();
   FreeConsole();
   FreeLibraryAndExitThread(g_module, 0);

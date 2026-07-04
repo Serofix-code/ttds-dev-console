@@ -16,6 +16,7 @@ This is an early proof-of-concept. It launches `WDC.exe`, watches the game's sta
 - can save the console/log session to a `.txt` file
 - can find the newest quicksave/autosave/checkpoint/save candidate with `reload`
 - uses colored live console output for saves/writes, archives, textures, camera-ish resources, mods, Relight, debug, and failures
+- can log live POV/camera pointer, position, rotation, and FOV using an experimental read-only camera hook
 - can toggle TTDS Relighting's freecam configuration when Relight is installed
 
 ## Modding / Archive Debugging
@@ -40,9 +41,16 @@ Write log lines show when the game actually writes bytes to a tracked file:
 [write] OK   WRITE prefs  saves\prefs.prop  bytes=853
 ```
 
-Texture and camera logging is currently resource/file-level telemetry. It can show texture archives/resources and camera-ish scene/chore files being opened or written, but it does not yet read live engine camera position, FOV, or GPU material swaps directly.
+Texture logging is currently resource/file-level telemetry. It can show texture archives/resources being opened or written, but it does not yet read GPU material swaps directly.
 
-When you run `log on`, the console switches to its verbose default: focus `all`, file tracing on, write tracing on, texture/camera resource tracing on, debug-string tracing on, and failures-only mode off. You can narrow it afterward with commands like `log focus saves`, `log focus textures`, or `log failures on`.
+Camera logging has two layers:
+
+- resource/debug telemetry: camera-named files and camera-related debug strings
+- live POV telemetry: an experimental read-only camera hook that logs camera pointer, position, rotation, and FOV
+
+The live POV hook is based on offsets/AOB patterns from the community Cheat Engine freecam table `twd_definitive_fc_xb_1.2.ct` by idk31. This console only ports the read/logging side by default, not the freecam movement patching from that table.
+
+When you run `log on`, the console switches to its verbose default: focus `all`, file tracing on, write tracing on, texture/camera resource tracing on, debug-string tracing on, live POV tracing on, and failures-only mode off. You can narrow it afterward with commands like `log focus saves`, `log focus textures`, or `log failures on`.
 
 ## Console Colour Codes
 
@@ -52,13 +60,13 @@ The live console uses Windows console colour attributes:
 | --- | --- | --- |
 | Bright red | `0x0C` | failures and errors |
 | Bright yellow | `0x0E` | save, prefs, and write activity |
-| Bright cyan | `0x0B` | camera-named resource/file activity |
+| Bright cyan | `0x0B` | camera resources, camera debug strings, and live POV logs |
 | Bright magenta | `0x0D` | texture and txmesh resource activity |
 | Bright green | `0x0A` | archive activity |
 | Bright white | `0x0F` | mods, Relight, and freecam |
 | Gray/default | `0x07` | debug strings and ordinary lines |
 
-The `[camera]` category does not mean live camera movement is hooked yet. It only appears when the game opens/writes camera-named resources or emits camera-related debug strings. Live camera position, FOV, and freecam movement need a Telltale engine/Lua hook or a graphics camera backend hook.
+The `[camera]` category can now include live POV logs when the experimental camera hook is installed. Freecam movement still requires Relight or a separate movement patch.
 
 ## Safety Notes
 
@@ -149,6 +157,12 @@ bin\x64\Release\TTDSConsoleLauncher.exe --watch-only --game "C:\Program Files (x
 - `console save [path]`: save the current console/log session as a `.txt` file
 - `reload`: find the newest quicksave/autosave/checkpoint/save candidate, prioritizing quick/autosaves first
 - `reload list`: list reload candidates from the save folder
+- `camera hook`: install the experimental read-only camera pointer hook
+- `camera status`: print current camera pointer, position, rotation, and FOV
+- `camera log on [ms]`: log live POV changes; default interval is 500 ms
+- `camera log off`: stop live POV logging
+- `camera interval <ms>`: set live POV logging interval
+- `pov ...`: alias for `camera ...`
 - `freecam`: toggle Relight's `FreeCameraOnlyMode` setting
 - `freecam on/off/status/path`: set or inspect Relight's freecam setting
 - `clear`: clear the console
