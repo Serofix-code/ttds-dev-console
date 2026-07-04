@@ -14,9 +14,12 @@ This is an early proof-of-concept. It launches `WDC.exe`, watches the game's sta
 - can check for installed mod archives and flag disabled/quarantine folders that the game may still scan
 - can show failed file opens to help diagnose missing Relight files, mod conflicts, and other load issues
 - can save the console/log session to a `.txt` file
+- can test-read/preload `.ttarch`, `.ttarch2`, and other files with `file load`
 - can find the newest quicksave/autosave/checkpoint/save candidate with `reload`
 - uses colored live console output for saves/writes, archives, textures, camera-ish resources, mods, Relight, debug, and failures
 - can log live POV/camera pointer, position, rotation, and FOV using an experimental read-only camera hook
+- can set camera FOV and lock the current POV manually
+- can log a 60-second long-load/stall diagnostic with recent file activity and failures
 - can toggle TTDS Relighting's freecam configuration when Relight is installed
 
 ## Modding / Archive Debugging
@@ -50,7 +53,9 @@ Camera logging has two layers:
 
 The live POV hook is based on offsets/AOB patterns from the community Cheat Engine freecam table `twd_definitive_fc_xb_1.2.ct` by idk31. This console only ports the read/logging side by default, not the freecam movement patching from that table.
 
-When you run `log on`, the console switches to its verbose default: focus `all`, file tracing on, write tracing on, texture/camera resource tracing on, debug-string tracing on, and failures-only mode off. Live POV tracing stays off by default because it can be noisy; enable it manually with `camera log on` or `pov log on`. You can narrow regular logging afterward with commands like `log focus saves`, `log focus textures`, or `log failures on`.
+When you run `log on`, the console switches to its verbose default: focus `all`, file tracing on, write tracing on, texture tracing on, debug-string tracing on, loading watchdog on, and failures-only mode off. Camera-resource tracing and live POV tracing stay off by default because they can be noisy; enable them manually with `log cameras on`, `camera log on`, or `pov log on`. You can narrow regular logging afterward with commands like `log focus saves`, `log focus textures`, or `log failures on`.
+
+If no tracked file activity is seen for 60 seconds while logging is enabled, the loading watchdog writes a `[watchdog]` diagnostic with recent file activity, recent failures, and basic modding/debugging hints. You can force this immediately with `loading diagnose`.
 
 ## Console Colour Codes
 
@@ -138,7 +143,7 @@ bin\x64\Release\TTDSConsoleLauncher.exe --watch-only --game "C:\Program Files (x
 - `where`: show current directory
 - `archives`: count files in the `Archives` folder
 - `log`: show log status
-- `log on`: start writing `ttds-dev-console.log` in the game folder, enable verbose/all tracing, and print live colored hook lines in the console; live POV logging stays off until `camera log on`
+- `log on`: start writing `ttds-dev-console.log` in the game folder, enable verbose/all tracing, and print live colored hook lines in the console; camera-resource and live POV logging stay off until manually enabled
 - `log off`: stop writing new log entries
 - `log console on/off`: show or hide live log lines in the console
 - `log format compact/full`: switch between readable short file logs and raw Windows file-open logs
@@ -146,6 +151,12 @@ bin\x64\Release\TTDSConsoleLauncher.exe --watch-only --game "C:\Program Files (x
 - `log failures on/off`: show all interesting file opens or only failed file opens
 - `log path`: print the log file path
 - `log mark <text>`: add a marker while testing a scene/menu/action
+- `file info <path>`: show file size and timestamp
+- `file load <path>`: test-read/preload a `.ttarch`, `.ttarch2`, or any other file; this does not mount the archive into the engine yet
+- `loading status`: show the loading watchdog state
+- `loading on/off`: enable or disable the 60-second long-load/stall diagnostic
+- `loading diagnose`: log a loading diagnostic immediately
+- `watchdog ...`: alias for `loading ...`
 - `log files on/off`: enable or disable file-open tracing
 - `log writes on/off`: enable or disable actual write tracing for tracked handles
 - `log textures on/off`: enable or disable texture/txmesh resource file tracing
@@ -161,6 +172,8 @@ bin\x64\Release\TTDSConsoleLauncher.exe --watch-only --game "C:\Program Files (x
 - `camera status`: print current camera pointer, position, rotation, and FOV
 - `camera log on [ms]`: log live POV changes; default interval is 500 ms
 - `camera log off`: stop live POV logging
+- `camera fov [value]`: print or set current camera FOV, clamped to `1.2..169`
+- `camera lock on/off`: lock or unlock the current camera position, rotation, and FOV
 - `camera interval <ms>`: set live POV logging interval
 - `pov ...`: alias for `camera ...`
 - `freecam`: toggle Relight's `FreeCameraOnlyMode` setting

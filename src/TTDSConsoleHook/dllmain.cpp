@@ -43,12 +43,23 @@ std::mutex g_cameraHookMutex;
 alignas(8) volatile uintptr_t g_cameraAddressRaw = 0;
 std::atomic_bool g_cameraPointerHookInstalled{false};
 std::atomic_bool g_cameraLiveLogEnabled{false};
+std::atomic_bool g_cameraLockEnabled{false};
 std::atomic_bool g_cameraMonitorRunning{false};
 std::atomic_int g_cameraLogIntervalMs{500};
 HANDLE g_cameraMonitorThread = nullptr;
 unsigned char* g_cameraHookTarget = nullptr;
 void* g_cameraHookStub = nullptr;
 unsigned char g_cameraHookOriginal[7]{};
+std::mutex g_cameraLockMutex;
+float g_cameraLockValues[13]{};
+std::mutex g_activityMutex;
+std::vector<std::wstring> g_recentFileActivity;
+std::vector<std::wstring> g_recentFileFailures;
+std::atomic_bool g_loadingWatchEnabled{true};
+std::atomic_bool g_loadingWatchRunning{false};
+std::atomic<unsigned long long> g_lastFileActivityTick{0};
+std::atomic<unsigned long long> g_lastLoadingDiagnosticTick{0};
+HANDLE g_loadingWatchThread = nullptr;
 
 using CreateFileWFn = HANDLE(WINAPI*)(
     LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
@@ -155,8 +166,8 @@ void PrintColorLegend() {
   PrintColoredLine(FOREGROUND_GREEN | FOREGROUND_INTENSITY, L"  bright green  0x0A  archive activity");
   PrintColoredLine(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY, L"  bright white  0x0F  mods, Relight, and freecam");
   PrintColoredLine(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE, L"  gray/default  0x07  debug strings and ordinary lines");
-  std::wcout << L"Camera note: [camera] currently means camera-related resource/file activity only.\n";
-  std::wcout << L"Live camera movement, FOV, and freecam movement need an engine/Lua or graphics camera hook.\n";
+  std::wcout << L"Camera note: camera-resource logs are off by default; use log cameras on.\n";
+  std::wcout << L"Live POV logs are manual; use camera log on or pov log on.\n";
 }
 
 std::wstring FocusModeText(int mode) {
@@ -773,6 +784,89 @@ std::wstring FormatWriteEvent(BOOL ok, DWORD requestedBytes, DWORD actualBytes, 
   return message.str();
 }
 
+void PushRecent(std::vector<std::wstring>* values, const std::wstring& value, size_t limit) {
+  values->push_back(value);
+  if (values->size() > limit) {
+    values->erase(values->begin(), values->begin() + static_cast<std::ptrdiff_t>(values->size() - limit));
+  }
+}
+
+void RecordFileActivity(const std::wstring& operation, const std::wstring& path, bool ok) {
+  g_lastFileActivityTick = GetTickCount64();
+  std::wstringstream entry;
+  entry << (ok ? L"OK " : L"FAIL ") << operation << L" " << FileKind(path) << L" " << CompactPath(path);
+
+  std::lock_guard<std::mutex> lock(g_activityMutex);
+  PushRecent(&g_recentFileActivity, entry.str(), 16);
+  if (!ok) {
+    PushRecent(&g_recentFileFailures, entry.str(), 16);
+  }
+}
+
+std::wstring JoinRecent(const std::vector<std::wstring>& values) {
+  if (values.empty()) return L"(none)";
+  std::wstringstream joined;
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i) joined << L" | ";
+    joined << values[i];
+  }
+  return joined.str();
+}
+
+void LogLoadingDiagnostic() {
+  std::vector<std::wstring> activity;
+  std::vector<std::wstring> failures;
+  {
+    std::lock_guard<std::mutex> lock(g_activityMutex);
+    activity = g_recentFileActivity;
+    failures = g_recentFileFailures;
+  }
+
+  const unsigned long long now = GetTickCount64();
+  const unsigned long long lastActivity = g_lastFileActivityTick.load();
+  const unsigned long long quietSeconds = lastActivity == 0 ? 0 : (now - lastActivity) / 1000;
+
+  LogLine(L"watchdog", L"possible long load/stall: no tracked file activity for " + std::to_wstring(quietSeconds) + L" seconds");
+  LogLine(L"watchdog", L"recent activity: " + JoinRecent(activity));
+  LogLine(L"watchdog", L"recent failures: " + JoinRecent(failures));
+  LogLine(L"watchdog", L"tips: check the last FAIL line, disabled/quarantine mod folders, missing archives, and huge texture/txmesh mods");
+}
+
+DWORD WINAPI LoadingWatchThread(void*) {
+  while (g_loadingWatchRunning) {
+    if (g_logEnabled && g_loadingWatchEnabled) {
+      const unsigned long long now = GetTickCount64();
+      const unsigned long long lastActivity = g_lastFileActivityTick.load();
+      const unsigned long long lastDiagnostic = g_lastLoadingDiagnosticTick.load();
+      if (lastActivity != 0 && now > lastActivity + 60000 && now > lastDiagnostic + 60000) {
+        g_lastLoadingDiagnosticTick = now;
+        LogLoadingDiagnostic();
+      }
+    }
+    Sleep(5000);
+  }
+  return 0;
+}
+
+void StartLoadingWatchThread() {
+  if (g_loadingWatchRunning) return;
+  g_loadingWatchRunning = true;
+  g_loadingWatchThread = CreateThread(nullptr, 0, LoadingWatchThread, nullptr, 0, nullptr);
+  if (!g_loadingWatchThread) {
+    g_loadingWatchRunning = false;
+  }
+}
+
+void StopLoadingWatchThread() {
+  if (!g_loadingWatchRunning) return;
+  g_loadingWatchRunning = false;
+  if (g_loadingWatchThread) {
+    WaitForSingleObject(g_loadingWatchThread, 1000);
+    CloseHandle(g_loadingWatchThread);
+    g_loadingWatchThread = nullptr;
+  }
+}
+
 struct SaveCandidate {
   fs::path path;
   std::wstring kind;
@@ -917,6 +1011,29 @@ bool IsReadableAddress(uintptr_t address, size_t bytes) {
   return address >= regionStart && address + bytes <= regionEnd;
 }
 
+bool SafeWriteMemory(uintptr_t address, const void* data, size_t bytes) {
+  DWORD oldProtect = 0;
+  if (!VirtualProtect(reinterpret_cast<void*>(address), bytes, PAGE_EXECUTE_READWRITE, &oldProtect)) return false;
+  bool ok = false;
+  __try {
+    memcpy(reinterpret_cast<void*>(address), data, bytes);
+    ok = true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    ok = false;
+  }
+  DWORD ignored = 0;
+  VirtualProtect(reinterpret_cast<void*>(address), bytes, oldProtect, &ignored);
+  return ok;
+}
+
+bool SafeWriteFloat(uintptr_t address, float value) {
+  return SafeWriteMemory(address, &value, sizeof(value));
+}
+
+bool SafeWriteWord(uintptr_t address, uint16_t value) {
+  return SafeWriteMemory(address, &value, sizeof(value));
+}
+
 bool ReadCameraState(CameraState* state) {
   const uintptr_t base = g_cameraAddressRaw;
   if (base < 0x10000 || !IsReadableAddress(base, 0x1CC)) return false;
@@ -954,6 +1071,92 @@ bool ReadCameraState(CameraState* state) {
   }
 
   *state = next;
+  return true;
+}
+
+const uintptr_t* CameraLockOffsets(size_t* count) {
+  static const uintptr_t offsets[] = {
+      0x100, 0x104, 0x108,
+      0x110, 0x114, 0x118,
+      0x120, 0x124, 0x128,
+      0x130, 0x134, 0x138,
+      0x1C8};
+  *count = sizeof(offsets) / sizeof(offsets[0]);
+  return offsets;
+}
+
+bool CaptureCameraLock(std::wstring* message) {
+  const uintptr_t base = g_cameraAddressRaw;
+  if (base < 0x10000 || !IsReadableAddress(base, 0x1CC)) {
+    if (message) *message = L"camera pointer is not ready; load a scene and try camera lock on again";
+    return false;
+  }
+
+  size_t count = 0;
+  const uintptr_t* offsets = CameraLockOffsets(&count);
+  float values[13]{};
+  for (size_t i = 0; i < count; ++i) {
+    if (!SafeReadFloat(base + offsets[i], &values[i])) {
+      if (message) *message = L"could not read camera values for lock";
+      return false;
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(g_cameraLockMutex);
+    memcpy(g_cameraLockValues, values, sizeof(values));
+  }
+
+  if (message) *message = L"POV lock captured current camera position/rotation/FOV";
+  return true;
+}
+
+bool ApplyCameraLock() {
+  const uintptr_t base = g_cameraAddressRaw;
+  if (base < 0x10000 || !IsReadableAddress(base, 0x1CC)) return false;
+
+  float values[13]{};
+  {
+    std::lock_guard<std::mutex> lock(g_cameraLockMutex);
+    memcpy(values, g_cameraLockValues, sizeof(values));
+  }
+
+  size_t count = 0;
+  const uintptr_t* offsets = CameraLockOffsets(&count);
+  bool ok = true;
+  for (size_t i = 0; i < count; ++i) {
+    ok = SafeWriteFloat(base + offsets[i], values[i]) && ok;
+  }
+  SafeWriteWord(base + 0x1C2, 0x0101);
+  return ok;
+}
+
+bool SetCameraFov(float fov, std::wstring* message) {
+  if (fov < 1.2f) fov = 1.2f;
+  if (fov > 169.0f) fov = 169.0f;
+
+  const uintptr_t base = g_cameraAddressRaw;
+  if (base < 0x10000 || !IsReadableAddress(base, 0x1CC)) {
+    if (message) *message = L"camera pointer is not ready; load a scene and try camera fov again";
+    return false;
+  }
+
+  if (!SafeWriteFloat(base + 0x1C8, fov)) {
+    if (message) *message = L"could not write camera FOV";
+    return false;
+  }
+  SafeWriteWord(base + 0x1C2, 0x0101);
+
+  if (g_cameraLockEnabled) {
+    std::lock_guard<std::mutex> lock(g_cameraLockMutex);
+    g_cameraLockValues[12] = fov;
+  }
+
+  if (message) {
+    std::wstringstream text;
+    text << std::fixed << std::setprecision(2) << L"camera FOV set to " << fov;
+    *message = text.str();
+  }
   return true;
 }
 
@@ -1129,6 +1332,9 @@ DWORD WINAPI CameraMonitorThread(void*) {
   bool hasLast = false;
   bool waitingLogged = false;
   while (g_cameraMonitorRunning) {
+    if (g_cameraLockEnabled) {
+      ApplyCameraLock();
+    }
     if (g_cameraLiveLogEnabled && g_logEnabled) {
       CameraState current;
       if (ReadCameraState(&current)) {
@@ -1171,6 +1377,7 @@ void StopCameraMonitorThread() {
 void PrintCameraStatus() {
   std::wcout << L"Camera hook: " << (g_cameraPointerHookInstalled ? L"installed" : L"not installed") << L"\n";
   std::wcout << L"POV log:     " << (g_cameraLiveLogEnabled ? L"on" : L"off") << L"\n";
+  std::wcout << L"POV lock:    " << (g_cameraLockEnabled ? L"on" : L"off") << L"\n";
   std::wcout << L"Interval:    " << g_cameraLogIntervalMs.load() << L" ms\n";
   CameraState state;
   if (ReadCameraState(&state)) {
@@ -1189,6 +1396,8 @@ void HandleCameraCommand(const std::vector<std::string>& parts) {
         << "  camera status         Print live camera pointer, position, rotation, and FOV\n"
         << "  camera log on [ms]    Log live POV changes; default interval is 500 ms\n"
         << "  camera log off        Stop live POV logging\n"
+        << "  camera fov [value]    Print or set FOV, clamped to 1.2..169\n"
+        << "  camera lock on/off    Lock/unlock the current POV position, rotation, and FOV\n"
         << "  camera interval <ms>  Set POV logging interval\n"
         << "  pov ...               Alias for camera ...\n";
     return;
@@ -1199,6 +1408,59 @@ void HandleCameraCommand(const std::vector<std::string>& parts) {
     const bool ok = InstallCameraPointerHook(&message);
     std::wcout << message << L"\n";
     LogLine(ok ? L"camera" : L"error", message);
+    return;
+  }
+
+  if (sub == "fov") {
+    std::wstring message;
+    const bool hookOk = InstallCameraPointerHook(&message);
+    if (!hookOk) {
+      std::wcout << message << L"\n";
+      LogLine(L"error", message);
+      return;
+    }
+    if (parts.size() > 2) {
+      const float fov = static_cast<float>(atof(parts[2].c_str()));
+      const bool ok = SetCameraFov(fov, &message);
+      std::wcout << message << L"\n";
+      LogLine(ok ? L"camera" : L"error", message);
+      return;
+    }
+    CameraState state;
+    if (ReadCameraState(&state)) {
+      std::wcout << L"Current FOV: " << state.fov << L"\n";
+    } else {
+      std::wcout << L"Camera pointer is not available yet.\n";
+    }
+    return;
+  }
+
+  if (sub == "lock") {
+    const std::string state = parts.size() > 2 ? ToLowerAscii(parts[2]) : "status";
+    if (state == "on") {
+      std::wstring message;
+      const bool hookOk = InstallCameraPointerHook(&message);
+      if (!hookOk) {
+        std::wcout << message << L"\n";
+        LogLine(L"error", message);
+        return;
+      }
+      const bool captured = CaptureCameraLock(&message);
+      if (captured) {
+        g_cameraLockEnabled = true;
+        StartCameraMonitorThread();
+      }
+      std::wcout << message << L"\n";
+      LogLine(captured ? L"camera" : L"error", captured ? L"POV lock on" : message);
+      return;
+    }
+    if (state == "off") {
+      g_cameraLockEnabled = false;
+      std::cout << "POV lock is OFF.\n";
+      LogLine(L"camera", L"POV lock off");
+      return;
+    }
+    std::wcout << L"POV lock: " << (g_cameraLockEnabled ? L"on" : L"off") << L"\n";
     return;
   }
 
@@ -1327,6 +1589,10 @@ HANDLE WINAPI HookCreateFileW(
 
   if (fileName) {
     const std::wstring path(fileName);
+    const std::wstring lower = ToLower(path);
+    if (!IsOwnConsoleLogPath(lower) && LooksInterestingPath(path)) {
+      RecordFileActivity(AccessVerb(desiredAccess), path, result != INVALID_HANDLE_VALUE);
+    }
     if (ShouldTrackHandle(path, result)) {
       RememberHandle(result, path);
     }
@@ -1365,6 +1631,10 @@ HANDLE WINAPI HookCreateFileA(
 
   if (fileName) {
     const std::wstring path = Utf8ToWide(fileName);
+    const std::wstring lower = ToLower(path);
+    if (!IsOwnConsoleLogPath(lower) && LooksInterestingPath(path)) {
+      RecordFileActivity(AccessVerb(desiredAccess), path, result != INVALID_HANDLE_VALUE);
+    }
     if (ShouldTrackHandle(path, result)) {
       RememberHandle(result, path);
     }
@@ -1394,6 +1664,12 @@ BOOL WINAPI HookWriteFile(
 
   if (!g_insideHook && g_logEnabled && g_writeTraceEnabled) {
     const std::wstring path = PathForHandle(file);
+    if (!path.empty()) {
+      const std::wstring lower = ToLower(path);
+      if (!IsOwnConsoleLogPath(lower) && LooksInterestingPath(path)) {
+        RecordFileActivity(L"WRITE", path, ok != FALSE);
+      }
+    }
     if (ShouldLogWriteEvent(path, ok)) {
       const DWORD actualBytes = numberOfBytesWritten ? *numberOfBytesWritten : (ok ? numberOfBytesToWrite : 0);
       g_insideHook = true;
@@ -1423,7 +1699,10 @@ VOID WINAPI HookOutputDebugStringW(LPCWSTR message) {
   }
   if (!g_insideHook && g_logEnabled && g_debugStringTraceEnabled && message) {
     g_insideHook = true;
-    LogLine(LogCategoryForDebugMessage(message), message);
+    const std::wstring category = LogCategoryForDebugMessage(message);
+    if (category != L"camera" || g_cameraTraceEnabled) {
+      LogLine(category, message);
+    }
     g_insideHook = false;
   }
   g_realOutputDebugStringW(message);
@@ -1436,7 +1715,10 @@ VOID WINAPI HookOutputDebugStringA(LPCSTR message) {
   if (!g_insideHook && g_logEnabled && g_debugStringTraceEnabled && message) {
     g_insideHook = true;
     const std::wstring wideMessage = Utf8ToWide(message);
-    LogLine(LogCategoryForDebugMessage(wideMessage), wideMessage);
+    const std::wstring category = LogCategoryForDebugMessage(wideMessage);
+    if (category != L"camera" || g_cameraTraceEnabled) {
+      LogLine(category, wideMessage);
+    }
     g_insideHook = false;
   }
   g_realOutputDebugStringA(message);
@@ -1500,12 +1782,16 @@ void PrintHelp() {
       << "  log debug on/off  Track OutputDebugString messages\n"
       << "  log path  Print the log file path\n"
       << "  log mark <text>  Add a marker to the log\n"
+      << "  file info <path>  Show file size/timestamp\n"
+      << "  file load <path>  Test-read/preload a .ttarch/.ttarch2 or any file\n"
+      << "  loading status/on/off/diagnose  60-second long-load watchdog\n"
+      << "  watchdog ...  Alias for loading ...\n"
       << "  hooks refresh    Re-apply file/debug hooks to newly loaded modules\n"
       << "  mods check  Find mod archives in folders that may still be scanned\n"
       << "  console save [path]  Save this session log as a .txt file\n"
       << "  reload    Find newest quicksave/autosave/checkpoint/save; live engine reload is not hooked yet\n"
       << "  reload list  List reload candidates\n"
-      << "  camera hook/status/log on/log off/interval <ms>\n"
+      << "  camera hook/status/log on/log off/interval <ms>/fov <value>/lock on/off\n"
       << "  pov ...  Alias for camera ...\n"
       << "  freecam   Toggle Relight freecam INI setting\n"
       << "  freecam on/off/status/path\n"
@@ -1528,6 +1814,8 @@ void PrintStatus() {
   std::wcout << L"Cameras:    " << (g_cameraTraceEnabled ? L"on" : L"off") << L"\n";
   std::wcout << L"POV hook:   " << (g_cameraPointerHookInstalled ? L"installed" : L"not installed") << L"\n";
   std::wcout << L"POV log:    " << (g_cameraLiveLogEnabled ? L"on" : L"off") << L"\n";
+  std::wcout << L"POV lock:   " << (g_cameraLockEnabled ? L"on" : L"off") << L"\n";
+  std::wcout << L"Watchdog:   " << (g_loadingWatchEnabled ? L"on" : L"off") << L"\n";
   std::wcout << L"Debug trace:" << (g_debugStringTraceEnabled ? L" on" : L" off") << L"\n";
   std::wcout << L"Log file:   " << g_logPath << L"\n";
   CameraState state;
@@ -1567,6 +1855,8 @@ void PrintLogStatus() {
   std::wcout << L"Cameras:    " << (g_cameraTraceEnabled ? L"on" : L"off") << L"\n";
   std::wcout << L"POV hook:   " << (g_cameraPointerHookInstalled ? L"installed" : L"not installed") << L"\n";
   std::wcout << L"POV log:    " << (g_cameraLiveLogEnabled ? L"on" : L"off") << L"\n";
+  std::wcout << L"POV lock:   " << (g_cameraLockEnabled ? L"on" : L"off") << L"\n";
+  std::wcout << L"Watchdog:   " << (g_loadingWatchEnabled ? L"on" : L"off") << L"\n";
   std::wcout << L"Debug trace:" << (g_debugStringTraceEnabled ? L" on" : L" off") << L"\n";
   std::wcout << L"Path:       " << g_logPath << L"\n";
 }
@@ -1623,6 +1913,146 @@ void SaveConsoleTranscript(const std::string& requestedPath) {
   LogLine(L"console", L"saved transcript to " + outputPath.wstring());
 }
 
+std::string CommandTailAfterSubcommand(const std::string& command, const std::vector<std::string>& parts) {
+  if (parts.size() < 2) return "";
+  const size_t verbAt = command.find(parts[0]);
+  const size_t subAt = command.find(parts[1], verbAt == std::string::npos ? 0 : verbAt + parts[0].size());
+  if (subAt == std::string::npos) return "";
+  return TrimAscii(command.substr(subAt + parts[1].size()));
+}
+
+std::string StripOuterQuotes(std::string value) {
+  value = TrimAscii(value);
+  if (value.size() >= 2 && ((value.front() == '"' && value.back() == '"') || (value.front() == '\'' && value.back() == '\''))) {
+    return value.substr(1, value.size() - 2);
+  }
+  return value;
+}
+
+fs::path ResolveConsolePath(const std::string& requestedPath) {
+  fs::path path = Utf8ToWide(StripOuterQuotes(requestedPath));
+  if (path.is_relative()) path = fs::current_path() / path;
+  return path.lexically_normal();
+}
+
+uint64_t Fnv1aUpdate(uint64_t hash, const char* data, size_t size) {
+  constexpr uint64_t prime = 1099511628211ULL;
+  for (size_t i = 0; i < size; ++i) {
+    hash ^= static_cast<unsigned char>(data[i]);
+    hash *= prime;
+  }
+  return hash;
+}
+
+void HandleFileCommand(const std::vector<std::string>& parts, const std::string& command) {
+  const std::string sub = parts.size() > 1 ? ToLowerAscii(parts[1]) : "help";
+  if (sub == "help" || parts.size() < 3) {
+    std::cout
+        << "File commands:\n"
+        << "  file info <path>  Show size and timestamp for any file\n"
+        << "  file load <path>  Test-read/preload a .ttarch/.ttarch2 or any file\n"
+        << "Note: file load does not mount archives into the Telltale engine yet.\n";
+    return;
+  }
+
+  const fs::path path = ResolveConsolePath(CommandTailAfterSubcommand(command, parts));
+  if (path.empty()) {
+    std::cout << "Missing path.\n";
+    return;
+  }
+
+  std::error_code error;
+  if (!fs::exists(path, error)) {
+    std::wcout << L"File not found: " << path << L"\n";
+    LogLine(L"file", L"manual " + Utf8ToWide(sub) + L" missing " + path.wstring());
+    return;
+  }
+  if (!fs::is_regular_file(path, error)) {
+    std::wcout << L"Not a regular file: " << path << L"\n";
+    return;
+  }
+
+  WIN32_FILE_ATTRIBUTE_DATA attributes{};
+  GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attributes);
+  const uintmax_t size = fs::file_size(path, error);
+
+  if (sub == "info") {
+    std::wcout << L"Path: " << path << L"\n";
+    std::wcout << L"Size: " << size << L" bytes\n";
+    std::wcout << L"Modified: " << FormatFileTimeText(attributes.ftLastWriteTime) << L"\n";
+    return;
+  }
+
+  if (sub == "load" || sub == "read") {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+      std::wcout << L"Could not open file: " << path << L"\n";
+      LogLine(L"file", L"manual load failed " + path.wstring());
+      return;
+    }
+
+    std::vector<char> buffer(1024 * 1024);
+    uint64_t total = 0;
+    uint64_t hash = 1469598103934665603ULL;
+    while (input) {
+      input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+      const std::streamsize read = input.gcount();
+      if (read <= 0) break;
+      total += static_cast<uint64_t>(read);
+      hash = Fnv1aUpdate(hash, buffer.data(), static_cast<size_t>(read));
+    }
+
+    std::wstringstream message;
+    message << L"manual load OK " << path.wstring()
+            << L" bytes=" << total
+            << L" fnv1a=0x" << std::hex << hash;
+    std::wcout << message.str() << L"\n";
+    LogLine(L"file", message.str());
+    return;
+  }
+
+  std::cout << "Unknown file command. Try: file info <path> or file load <path>\n";
+}
+
+void PrintLoadingWatchStatus() {
+  const unsigned long long now = GetTickCount64();
+  const unsigned long long lastActivity = g_lastFileActivityTick.load();
+  const unsigned long long quietSeconds = lastActivity == 0 ? 0 : (now - lastActivity) / 1000;
+  std::wcout << L"Loading watchdog: " << (g_loadingWatchEnabled ? L"on" : L"off") << L"\n";
+  std::wcout << L"Watch thread:      " << (g_loadingWatchRunning ? L"running" : L"stopped") << L"\n";
+  std::wcout << L"Quiet time:        " << quietSeconds << L" seconds\n";
+}
+
+void HandleLoadingCommand(const std::vector<std::string>& parts) {
+  const std::string sub = parts.size() > 1 ? ToLowerAscii(parts[1]) : "status";
+  if (sub == "help") {
+    std::cout
+        << "Loading watchdog commands:\n"
+        << "  loading status       Show watchdog state\n"
+        << "  loading on/off       Enable or disable the 60-second stall diagnostic\n"
+        << "  loading diagnose     Log a diagnostic immediately\n"
+        << "  watchdog ...         Alias for loading ...\n";
+    return;
+  }
+  if (sub == "on") {
+    g_loadingWatchEnabled = true;
+    StartLoadingWatchThread();
+    PrintLoadingWatchStatus();
+    return;
+  }
+  if (sub == "off") {
+    g_loadingWatchEnabled = false;
+    PrintLoadingWatchStatus();
+    return;
+  }
+  if (sub == "diagnose" || sub == "diag") {
+    LogLoadingDiagnostic();
+    std::cout << "Loading diagnostic logged.\n";
+    return;
+  }
+  PrintLoadingWatchStatus();
+}
+
 void SetLogEnabled(bool enabled) {
   OpenLogFile();
   if (enabled) {
@@ -1632,16 +2062,21 @@ void SetLogEnabled(bool enabled) {
     g_writeTraceEnabled = true;
     g_debugStringTraceEnabled = true;
     g_textureTraceEnabled = true;
-    g_cameraTraceEnabled = true;
+    g_cameraTraceEnabled = false;
     g_logFailuresOnly = false;
     g_logFocusMode = 0;
     g_cameraLiveLogEnabled = false;
+    g_cameraLockEnabled = false;
+    g_lastFileActivityTick = GetTickCount64();
+    g_lastLoadingDiagnosticTick = 0;
+    StartLoadingWatchThread();
   } else {
     g_cameraLiveLogEnabled = false;
+    g_cameraLockEnabled = false;
   }
   g_logEnabled = enabled;
   LogLine(L"console", enabled ? L"log on; verbose/all tracing enabled; POV logging manual" : L"log off");
-  std::cout << (enabled ? "Log enabled. Default mode is now focus=all with file/write/debug/texture/camera-resource tracing on. Live POV logging is off; use camera log on.\n" : "Log disabled.\n");
+  std::cout << (enabled ? "Log enabled. Default mode is now focus=all with file/write/debug/texture/watchdog tracing on. Camera tracing and live POV logging are off; use log cameras on or camera log on.\n" : "Log disabled.\n");
   std::wcout << L"Path: " << g_logPath << L"\n";
 }
 
@@ -1678,7 +2113,7 @@ DWORD WINAPI ConsoleThread(void*) {
   const int patchedImports = InstallHooks();
 
   std::cout << "TTDS Dev Console injected.\n";
-  std::cout << "This is v0.1.7: console, command loop, colored verbose logging, manual live POV logging, freecam state.\n";
+  std::cout << "This is v0.1.8: console, command loop, file loader, loading watchdog, manual camera tools.\n";
   std::cout << "Hooked import entries: " << patchedImports << "\n";
   PrintHelp();
 
@@ -1699,6 +2134,10 @@ DWORD WINAPI ConsoleThread(void*) {
       std::wcout << fs::current_path() << L"\n";
     } else if (verb == "archives") {
       CountArchives();
+    } else if (verb == "file") {
+      HandleFileCommand(parts, command);
+    } else if (verb == "loading" || verb == "watchdog") {
+      HandleLoadingCommand(parts);
     } else if (verb == "log") {
       const std::string sub = parts.size() > 1 ? ToLowerAscii(parts[1]) : "status";
       if (sub == "on") {
@@ -1813,7 +2252,9 @@ DWORD WINAPI ConsoleThread(void*) {
   }
 
   g_cameraLiveLogEnabled = false;
+  g_cameraLockEnabled = false;
   StopCameraMonitorThread();
+  StopLoadingWatchThread();
   UninstallCameraPointerHook();
   CloseLogFile();
   FreeConsole();
