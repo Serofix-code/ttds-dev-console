@@ -1486,7 +1486,7 @@ void PrintHelp() {
       << "  where     Show current working directory\n"
       << "  archives  Count files in the Archives folder\n"
       << "  log       Show log status\n"
-      << "  log on    Start writing ttds-dev-console.log\n"
+      << "  log on    Start writing ttds-dev-console.log; live POV logging stays off until camera log on\n"
       << "  log off   Stop writing the log\n"
       << "  log console on/off  Show or hide live log lines in this console\n"
       << "  log format compact/full  Change file log readability\n"
@@ -1635,19 +1635,13 @@ void SetLogEnabled(bool enabled) {
     g_cameraTraceEnabled = true;
     g_logFailuresOnly = false;
     g_logFocusMode = 0;
-    std::wstring cameraMessage;
-    const bool cameraOk = InstallCameraPointerHook(&cameraMessage);
-    if (cameraOk) {
-      StartCameraMonitorThread();
-      g_cameraLiveLogEnabled = true;
-    }
-    LogLine(cameraOk ? L"camera" : L"error", cameraMessage);
+    g_cameraLiveLogEnabled = false;
   } else {
     g_cameraLiveLogEnabled = false;
   }
   g_logEnabled = enabled;
-  LogLine(L"console", enabled ? L"log on; verbose/all tracing and POV logging enabled" : L"log off");
-  std::cout << (enabled ? "Log enabled. Default mode is now focus=all with file/write/debug/texture/camera/POV tracing on.\n" : "Log disabled.\n");
+  LogLine(L"console", enabled ? L"log on; verbose/all tracing enabled; POV logging manual" : L"log off");
+  std::cout << (enabled ? "Log enabled. Default mode is now focus=all with file/write/debug/texture/camera-resource tracing on. Live POV logging is off; use camera log on.\n" : "Log disabled.\n");
   std::wcout << L"Path: " << g_logPath << L"\n";
 }
 
@@ -1684,7 +1678,7 @@ DWORD WINAPI ConsoleThread(void*) {
   const int patchedImports = InstallHooks();
 
   std::cout << "TTDS Dev Console injected.\n";
-  std::cout << "This is v0.1.6: console, command loop, colored verbose logging, live POV logging, freecam state.\n";
+  std::cout << "This is v0.1.7: console, command loop, colored verbose logging, manual live POV logging, freecam state.\n";
   std::cout << "Hooked import entries: " << patchedImports << "\n";
   PrintHelp();
 

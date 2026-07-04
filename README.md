@@ -50,7 +50,7 @@ Camera logging has two layers:
 
 The live POV hook is based on offsets/AOB patterns from the community Cheat Engine freecam table `twd_definitive_fc_xb_1.2.ct` by idk31. This console only ports the read/logging side by default, not the freecam movement patching from that table.
 
-When you run `log on`, the console switches to its verbose default: focus `all`, file tracing on, write tracing on, texture/camera resource tracing on, debug-string tracing on, live POV tracing on, and failures-only mode off. You can narrow it afterward with commands like `log focus saves`, `log focus textures`, or `log failures on`.
+When you run `log on`, the console switches to its verbose default: focus `all`, file tracing on, write tracing on, texture/camera resource tracing on, debug-string tracing on, and failures-only mode off. Live POV tracing stays off by default because it can be noisy; enable it manually with `camera log on` or `pov log on`. You can narrow regular logging afterward with commands like `log focus saves`, `log focus textures`, or `log failures on`.
 
 ## Console Colour Codes
 
@@ -138,7 +138,7 @@ bin\x64\Release\TTDSConsoleLauncher.exe --watch-only --game "C:\Program Files (x
 - `where`: show current directory
 - `archives`: count files in the `Archives` folder
 - `log`: show log status
-- `log on`: start writing `ttds-dev-console.log` in the game folder, enable verbose/all tracing, and print live colored hook lines in the console
+- `log on`: start writing `ttds-dev-console.log` in the game folder, enable verbose/all tracing, and print live colored hook lines in the console; live POV logging stays off until `camera log on`
 - `log off`: stop writing new log entries
 - `log console on/off`: show or hide live log lines in the console
 - `log format compact/full`: switch between readable short file logs and raw Windows file-open logs
